@@ -1,0 +1,4 @@
+interface:
+  display_name: "Verify Change"
+  short_description: "Run proportionate Rust change verification"
+  default_prompt: "Use $verify-change to verify this repository change and report the evidence."

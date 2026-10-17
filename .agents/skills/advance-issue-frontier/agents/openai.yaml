@@ -1,0 +1,4 @@
+interface:
+  display_name: "Advance Issue Frontier"
+  short_description: "Recompute and update dependency-ready Issues"
+  default_prompt: "Use $advance-issue-frontier to evaluate the Issue frontier and report or apply authorized status changes."

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Refactor Docs"
+  short_description: "Source-audited rewrite of an existing docs page without losing facts."
+  default_prompt: "Refactor the named docs page using source-audited preservation; keep, move, or delete each behavior fact explicitly."
+
+policy:
+  allow_implicit_invocation: true

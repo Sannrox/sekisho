@@ -1,0 +1,4 @@
+interface:
+  display_name: "Assess Change Impact"
+  short_description: "Map change risk across project boundaries"
+  default_prompt: "Use $assess-change-impact to map the risks and required evidence for this change."

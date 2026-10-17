@@ -1,0 +1,4 @@
+interface:
+  display_name: "Capture Project Decision"
+  short_description: "Promote decisions into durable knowledge"
+  default_prompt: "Use $capture-project-decision to record the durable outcome of this design decision."

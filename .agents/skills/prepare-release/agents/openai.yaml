@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare Release"
+  short_description: "Build evidence for a safe project release"
+  default_prompt: "Use $prepare-release to prepare the next sekai-chisei release."

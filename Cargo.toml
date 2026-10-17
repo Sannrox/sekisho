@@ -1,0 +1,9 @@
+[package]
+name = "sekisho"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Governed tool gateway for AI agents: one MCP entry point with per-agent identity, token exchange, tool registry, rate limits, approvals and audit."
+publish = false
+
+[dependencies]

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shape Work Item"
+  short_description: "Turn an idea into decision-ready GitHub work"
+  default_prompt: "Use $shape-work-item to turn this request into a focused GitHub issue."

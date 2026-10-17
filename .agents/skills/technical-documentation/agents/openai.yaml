@@ -1,0 +1,7 @@
+interface:
+  display_name: "Technical Documentation"
+  short_description: "Build and review technical documentation for brownfield and evergreen systems."
+  default_prompt: "Build or review technical documentation with a clear, maintainable, and production-ready workflow. Prefer report-only unless asked to apply fixes."
+
+policy:
+  allow_implicit_invocation: true

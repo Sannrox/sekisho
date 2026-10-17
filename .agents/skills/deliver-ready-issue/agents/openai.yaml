@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deliver Ready Issue"
+  short_description: "Take a ready Issue through verified delivery"
+  default_prompt: "Use $deliver-ready-issue to deliver this ready GitHub Issue within the requested authority."
