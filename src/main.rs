@@ -160,13 +160,12 @@ async fn serve(config: &Config) -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     println!("listening on {}", listener.local_addr()?);
-    let app = router(
-        state,
-        &config.mcp,
+    let gateway = sekisho::gateway::Gateway::new(
         federation,
         config.policy.clone(),
-        shutdown.clone(),
+        sekisho::exchange::Exchanger::new(config.exchange.clone()),
     );
+    let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;

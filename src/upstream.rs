@@ -1,9 +1,8 @@
 //! MCP client calls to an upstream server: list its tools, call one.
 //!
 //! Each call opens a short stateless connection. The listing token is only
-//! used to list tools: a tool call never carries it, so a caller cannot
-//! borrow Sekisho's credential. Calls carry no credential until per-call
-//! token exchange (#4) supplies one scoped to the caller.
+//! used to list tools. A tool call carries the delegated token exchanged for
+//! that caller and tool ([`crate::exchange`]), never Sekisho's credential.
 
 use std::path::Path;
 
@@ -84,8 +83,9 @@ pub async fn call_tool(
     upstream: &UpstreamConfig,
     tool: &str,
     arguments: Option<JsonObject>,
+    delegated_token: String,
 ) -> Result<CallToolResult, UpstreamError> {
-    let client = connect(upstream, None).await?;
+    let client = connect(upstream, Some(delegated_token)).await?;
     let mut params = CallToolRequestParams::new(tool.to_string());
     params.arguments = arguments;
     let result = client

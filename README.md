@@ -37,8 +37,18 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   approved version. Upstream listings and the registry file are re-read
   every `refresh_interval_ms`, so changes apply without a restart. Owner
   edits are appended to the audit file.
-  The optional `token_file` is used only to list tools. Tool calls never
-  carry it; per-call token exchange supplies a caller-scoped credential.
+  The optional `token_file` is used only to list tools; tool calls never
+  carry it.
+- **Per-call token exchange.** For each tool call Sekisho exchanges the
+  caller's token at `[exchange] token_endpoint` (RFC 8693, client
+  authenticated) for a short-lived token with the upstream's `audience` and
+  `scope = tool:<name>` plus the agent's ceiling as `grant:<g>` scopes,
+  which the issuer intersects with the user's grants. The issuer puts the user in `sub` and the gateway
+  and agent in `act`. The engine sees only that token. Tokens are cached per
+  caller token, agent, ceiling, audience and tool until shortly before the
+  issuer's `expires_in`; tokens without it are not cached. If the
+  exchange fails, or `[exchange]` is not configured, the call is refused
+  and audited; nothing broader is tried.
 
   ```sh
   sekisho --config sekisho.toml registry list

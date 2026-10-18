@@ -61,6 +61,16 @@ pub struct Principal {
     pub actor: Option<serde_json::Value>,
 }
 
+/// The caller's raw bearer token, kept only to exchange it per call.
+#[derive(Clone)]
+pub struct CallerToken(pub String);
+
+impl std::fmt::Debug for CallerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallerToken([redacted])")
+    }
+}
+
 pub enum Verifier {
     Jwks {
         issuer: String,

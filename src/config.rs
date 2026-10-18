@@ -32,6 +32,9 @@ pub struct Config {
     pub registry: RegistryConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Per-call token exchange. Without it, tool calls are refused.
+    #[serde(default)]
+    pub exchange: Option<ExchangeConfig>,
     /// Upstream MCP servers whose tools the registry federates.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -55,6 +58,24 @@ impl Default for RegistryConfig {
             refresh_interval_ms: 30_000,
         }
     }
+}
+
+/// RFC 8693 token exchange at the issuer ([`crate::exchange`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExchangeConfig {
+    pub token_endpoint: String,
+    /// Sekisho's client id at the issuer.
+    pub client_id: String,
+    /// File holding the client secret; never inlined in the config.
+    pub client_secret_file: PathBuf,
+    /// Requested lifetime of exchanged tokens.
+    #[serde(default = "default_lifetime_secs")]
+    pub lifetime_secs: u64,
+}
+
+fn default_lifetime_secs() -> u64 {
+    60
 }
 
 /// Per-agent allowlists ([`crate::policy`]).
@@ -87,6 +108,8 @@ pub struct UpstreamConfig {
     /// Optional bearer token file used to list the upstream's tools.
     #[serde(default)]
     pub token_file: Option<PathBuf>,
+    /// Audience of exchanged tokens for this upstream's tools.
+    pub audience: String,
 }
 
 /// The MCP endpoint at `/mcp` and its OAuth protected-resource metadata.
@@ -155,6 +178,9 @@ impl Config {
         config.registry.audit_file = base.join(&config.registry.audit_file);
         config.policy.file = base.join(&config.policy.file);
         config.policy.audit_file = base.join(&config.policy.audit_file);
+        if let Some(exchange) = &mut config.exchange {
+            exchange.client_secret_file = base.join(&exchange.client_secret_file);
+        }
         for upstream in &mut config.upstreams {
             if let Some(token_file) = &mut upstream.token_file {
                 *token_file = base.join(&*token_file);

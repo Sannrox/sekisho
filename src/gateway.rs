@@ -22,9 +22,10 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{McpConfig, PolicyConfig, UpstreamConfig};
+use crate::exchange::Exchanger;
 use crate::policy::{AgentPolicy, PolicyFile, Refusal, agent_id, audit_refusal};
 use crate::registry::{self, Registry};
-use crate::verifier::Principal;
+use crate::verifier::{CallerToken, Principal};
 
 /// Longest wait for one upstream's tool listing during a refresh.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -110,9 +111,18 @@ impl Federation {
 pub struct Gateway {
     federation: Arc<Federation>,
     policy: Arc<PolicyConfig>,
+    exchanger: Arc<Exchanger>,
 }
 
 impl Gateway {
+    pub fn new(federation: Arc<Federation>, policy: PolicyConfig, exchanger: Exchanger) -> Self {
+        Self {
+            federation,
+            policy: Arc::new(policy),
+            exchanger: Arc::new(exchanger),
+        }
+    }
+
     /// The caller's agent and its policy, loaded fresh. Fails closed when
     /// the principal is missing or the policy file cannot be loaded.
     fn caller(
@@ -234,10 +244,30 @@ impl ServerHandler for Gateway {
             .iter()
             .find(|upstream| upstream.name == entry.upstream)
             .ok_or_else(|| McpError::internal_error("tool upstream is not configured", None))?;
+        let caller_token = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<CallerToken>())
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("request has no caller token", None))?;
+        let delegated = self
+            .exchanger
+            .token(crate::exchange::Request {
+                caller_token: &caller_token.0,
+                agent: &agent.id,
+                ceiling: &agent.ceiling,
+                audience: &upstream.audience,
+                tool: &entry.name,
+            })
+            .await
+            .map_err(|error| {
+                eprintln!("{error}");
+                self.refuse(&principal, &request.name, "token exchange failed")
+            })?;
         // A cancelled or disconnected caller drops the upstream call, which
         // closes its connection.
         tokio::select! {
-            result = crate::upstream::call_tool(upstream, &entry.name, request.arguments) => result
+            result = crate::upstream::call_tool(upstream, &entry.name, request.arguments, delegated) => result
                 .map(CallToolResponse::Complete)
                 .map_err(|error| McpError::internal_error(error.to_string(), None)),
             () = context.ct.cancelled() => Err(McpError::internal_error("request cancelled", None)),
@@ -248,8 +278,7 @@ impl ServerHandler for Gateway {
 /// Stateless Streamable HTTP service. `shutdown` ends in-flight streams.
 pub fn service(
     config: &McpConfig,
-    federation: Arc<Federation>,
-    policy: PolicyConfig,
+    gateway: Gateway,
     shutdown: CancellationToken,
 ) -> StreamableHttpService<Gateway, NeverSessionManager> {
     let http = StreamableHttpServerConfig::default()
@@ -260,14 +289,8 @@ pub fn service(
         .enforce_origin_validation()
         .with_max_request_body_bytes(config.max_request_bytes)
         .with_cancellation_token(shutdown);
-    let policy = Arc::new(policy);
     StreamableHttpService::new(
-        move || {
-            Ok(Gateway {
-                federation: federation.clone(),
-                policy: policy.clone(),
-            })
-        },
+        move || Ok(gateway.clone()),
         Arc::new(NeverSessionManager::default()),
         http,
     )

@@ -27,7 +27,14 @@ refresh_interval_ms = 30000            # re-list upstreams and reload the regist
 name = "ontology"                      # tools appear as ontology.<tool>
 url = "http://127.0.0.1:9100/mcp"
 # token_file = "ontology-token"        # optional bearer used to list tools
+audience = "ontology-engine"           # audience of exchanged tokens for these tools
 
 [policy]
 file = "agents.toml"                   # per-agent allowlists, read on every call
 audit_file = "agent-refusals.jsonl"    # one line per refused call
+
+[exchange]                             # RFC 8693 token exchange per tool call
+token_endpoint = "https://issuer.example.test/token"
+client_id = "sekisho"
+client_secret_file = "exchange-secret"
+# lifetime_secs = 60
