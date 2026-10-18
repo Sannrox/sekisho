@@ -28,6 +28,44 @@ pub struct Config {
     pub listen: SocketAddr,
     pub verifier: VerifierConfig,
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub registry: RegistryConfig,
+    /// Upstream MCP servers whose tools the registry federates.
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConfig {
+    pub file: PathBuf,
+    /// Owner edits, one JSON line each.
+    pub audit_file: PathBuf,
+    /// How often upstream listings and the registry file are re-read.
+    pub refresh_interval_ms: u64,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            file: "registry.json".into(),
+            audit_file: "registry-audit.jsonl".into(),
+            refresh_interval_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfig {
+    /// Prefix of this upstream's tools (`<name>.<tool>`): ASCII letters,
+    /// digits, `-` and `_`.
+    pub name: String,
+    /// The upstream's Streamable HTTP MCP endpoint.
+    pub url: String,
+    /// Optional bearer token file used to list the upstream's tools.
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
 }
 
 /// The MCP endpoint at `/mcp` and its OAuth protected-resource metadata.
@@ -92,6 +130,13 @@ impl Config {
             VerifierConfig::Jwks { jwks_file, .. } => *jwks_file = base.join(&*jwks_file),
             VerifierConfig::Static { token_file } => *token_file = base.join(&*token_file),
         }
+        config.registry.file = base.join(&config.registry.file);
+        config.registry.audit_file = base.join(&config.registry.audit_file);
+        for upstream in &mut config.upstreams {
+            if let Some(token_file) = &mut upstream.token_file {
+                *token_file = base.join(&*token_file);
+            }
+        }
         config.validate()?;
         Ok(config)
     }
@@ -101,6 +146,25 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "mcp needs a resource URL and at least one authorization server".into(),
             ));
+        }
+        if self.registry.refresh_interval_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "registry refresh_interval_ms must be positive".into(),
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for upstream in &self.upstreams {
+            let valid = !upstream.name.is_empty()
+                && upstream
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            if !valid || !names.insert(&upstream.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "upstream name {:?} must be unique and use letters, digits, - or _",
+                    upstream.name
+                )));
+            }
         }
         if self.mcp.max_request_bytes == 0 {
             return Err(ConfigError::Invalid(

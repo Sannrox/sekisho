@@ -17,3 +17,13 @@ authorization_servers = ["https://issuer.example.test"]
 # allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]   # default; set your public host
 # allowed_origins = ["https://console.example.test:443"] # browsers only; default refuses any Origin
 # max_request_bytes = 1048576
+
+[registry]
+file = "registry.json"                 # owner state; edit with `sekisho registry`
+audit_file = "registry-audit.jsonl"    # one line per owner edit
+refresh_interval_ms = 30000            # re-list upstreams and reload the registry
+
+[[upstreams]]
+name = "ontology"                      # tools appear as ontology.<tool>
+url = "http://127.0.0.1:9100/mcp"
+# token_file = "ontology-token"        # optional bearer used to list tools

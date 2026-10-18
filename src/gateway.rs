@@ -2,26 +2,112 @@
 //!
 //! Streamable HTTP, protocol negotiation, Host and Origin validation, and
 //! the request-size cap come from the official Rust SDK. 2026-07-28 is
-//! served statelessly; 2025-11-25 clients negotiate down to it. Tools arrive
-//! with the registry; until then the tool list is empty.
+//! served statelessly; 2025-11-25 clients negotiate down to it. Tools come
+//! from the [`Federation`]: only owner-enabled registry tools are listed or
+//! callable, with their approved description.
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
-use rmcp::ServerHandler;
-use rmcp::model::{Implementation, InitializeResult, ProtocolVersion, ServerCapabilities};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, Implementation, InitializeResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, Tool,
+};
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::McpConfig;
+use crate::config::{McpConfig, UpstreamConfig};
+use crate::registry::{self, Registry};
+
+/// Longest wait for one upstream's tool listing during a refresh.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Protocol versions Sekisho speaks, newest first.
 pub const PROTOCOL_VERSIONS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 
-#[derive(Clone, Default)]
-pub struct Gateway;
+/// Upstreams and the registry snapshot the data plane serves from.
+pub struct Federation {
+    pub upstreams: Vec<UpstreamConfig>,
+    pub registry_file: PathBuf,
+    registry: RwLock<Registry>,
+}
+
+impl Federation {
+    pub fn new(upstreams: Vec<UpstreamConfig>, registry_file: PathBuf) -> Self {
+        Self {
+            upstreams,
+            registry_file,
+            registry: RwLock::default(),
+        }
+    }
+
+    pub fn snapshot(&self) -> Registry {
+        self.registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Re-list every upstream, merge the listings into the registry file,
+    /// and serve the result. An unreachable upstream lists nothing, so its
+    /// tools stop being served until it answers again.
+    pub async fn refresh(&self) -> Result<(), registry::RegistryError> {
+        // Concurrent and bounded, so one stalled upstream cannot hold back
+        // the others or owner edits.
+        let mut listings = tokio::task::JoinSet::new();
+        for upstream in self.upstreams.clone() {
+            listings.spawn(async move {
+                let listed =
+                    tokio::time::timeout(LISTING_TIMEOUT, crate::upstream::list_tools(&upstream))
+                        .await
+                        .unwrap_or_else(|_| Err(crate::upstream::timed_out(&upstream)))
+                        .unwrap_or_else(|error| {
+                            eprintln!("{error}");
+                            Vec::new()
+                        });
+                (upstream.name, listed)
+            });
+        }
+        let listings = listings.join_all().await;
+        let configured: Vec<&str> = self.upstreams.iter().map(|u| u.name.as_str()).collect();
+        let ((), registry) = registry::edit(&self.registry_file, |registry| {
+            registry.retain_upstreams(&configured);
+            for (upstream, listed) in &listings {
+                registry.observe(upstream, listed);
+            }
+            Ok(())
+        })?;
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = registry;
+        Ok(())
+    }
+
+    /// Refresh every `interval` until `shutdown`.
+    pub async fn run(self: Arc<Self>, interval: Duration, shutdown: CancellationToken) {
+        loop {
+            if let Err(error) = self.refresh().await {
+                eprintln!("registry refresh failed: {error}");
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(interval) => {}
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Gateway {
+    federation: Arc<Federation>,
+}
 
 impl ServerHandler for Gateway {
     fn get_info(&self) -> InitializeResult {
@@ -32,11 +118,69 @@ impl ServerHandler for Gateway {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(PROTOCOL_VERSIONS)
     }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let registry = self.federation.snapshot();
+        let tools = registry
+            .tools
+            .iter()
+            .filter(|(_, entry)| entry.served())
+            .map(|(key, entry)| {
+                let version = entry.approved_version();
+                let schema = match &version.input_schema {
+                    serde_json::Value::Object(schema) => schema.clone(),
+                    _ => Default::default(),
+                };
+                Tool::new_with_raw(
+                    key.clone(),
+                    version.description.clone().map(Cow::Owned),
+                    Arc::new(schema),
+                )
+            })
+            .collect();
+        Ok(ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        let entry = self
+            .federation
+            .snapshot()
+            .tools
+            .get(request.name.as_ref())
+            .filter(|entry| entry.served())
+            .cloned()
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("tool {} is not enabled", request.name), None)
+            })?;
+        let upstream = self
+            .federation
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == entry.upstream)
+            .ok_or_else(|| McpError::internal_error("tool upstream is not configured", None))?;
+        // A cancelled or disconnected caller drops the upstream call, which
+        // closes its connection.
+        tokio::select! {
+            result = crate::upstream::call_tool(upstream, &entry.name, request.arguments) => result
+                .map(CallToolResponse::Complete)
+                .map_err(|error| McpError::internal_error(error.to_string(), None)),
+            () = context.ct.cancelled() => Err(McpError::internal_error("request cancelled", None)),
+        }
+    }
 }
 
 /// Stateless Streamable HTTP service. `shutdown` ends in-flight streams.
 pub fn service(
     config: &McpConfig,
+    federation: Arc<Federation>,
     shutdown: CancellationToken,
 ) -> StreamableHttpService<Gateway, NeverSessionManager> {
     let http = StreamableHttpServerConfig::default()
@@ -48,7 +192,11 @@ pub fn service(
         .with_max_request_body_bytes(config.max_request_bytes)
         .with_cancellation_token(shutdown);
     StreamableHttpService::new(
-        || Ok(Gateway),
+        move || {
+            Ok(Gateway {
+                federation: federation.clone(),
+            })
+        },
         Arc::new(NeverSessionManager::default()),
         http,
     )

@@ -10,5 +10,7 @@ pub mod config;
 pub mod diagnostics;
 pub mod gateway;
 pub mod metrics;
+pub mod registry;
 pub mod server;
+pub mod upstream;
 pub mod verifier;
