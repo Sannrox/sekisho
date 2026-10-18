@@ -36,7 +36,11 @@ async fn start() -> Running {
         metrics: Default::default(),
     });
     let shutdown = CancellationToken::new();
-    let app = router(state, &config.mcp, shutdown.clone());
+    let federation = Arc::new(sekisho::gateway::Federation::new(
+        Vec::new(),
+        config.registry.file.clone(),
+    ));
+    let app = router(state, &config.mcp, federation, shutdown.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let stop = shutdown.clone();
@@ -197,7 +201,11 @@ async fn configured_browser_origins_pass_cors_preflight() {
         metrics: Default::default(),
     });
     let shutdown = CancellationToken::new();
-    let app = router(state, &config.mcp, shutdown.clone());
+    let federation = Arc::new(sekisho::gateway::Federation::new(
+        Vec::new(),
+        config.registry.file.clone(),
+    ));
+    let app = router(state, &config.mcp, federation, shutdown.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let stop = shutdown.clone();

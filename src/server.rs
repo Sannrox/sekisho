@@ -62,7 +62,12 @@ struct McpAuth {
     challenge: HeaderValue,
 }
 
-pub fn router(state: Arc<AppState>, mcp: &McpConfig, shutdown: CancellationToken) -> Router {
+pub fn router(
+    state: Arc<AppState>,
+    mcp: &McpConfig,
+    federation: Arc<crate::gateway::Federation>,
+    shutdown: CancellationToken,
+) -> Router {
     let metadata = ProtectedResource {
         resource: mcp.resource.clone(),
         authorization_servers: mcp.authorization_servers.clone(),
@@ -82,7 +87,7 @@ pub fn router(state: Arc<AppState>, mcp: &McpConfig, shutdown: CancellationToken
         async move { axum::Json(metadata) }
     });
     let mcp_service = Router::new()
-        .nest_service("/mcp", crate::gateway::service(mcp, shutdown))
+        .nest_service("/mcp", crate::gateway::service(mcp, federation, shutdown))
         .layer(middleware::from_fn_with_state(auth, require_bearer));
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
