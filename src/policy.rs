@@ -78,27 +78,6 @@ pub fn agent_id(principal: &Principal) -> Option<String> {
     actor.filter(|id| !id.trim().is_empty()).map(str::to_string)
 }
 
-/// A refused call, appended as one JSON line to the policy audit file.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Refusal {
-    pub at_unix_ms: u128,
-    pub subject: String,
-    pub agent: String,
-    pub tool: String,
-    pub reason: String,
-}
-
-pub fn audit_refusal(audit: &Path, refusal: &Refusal) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut line = serde_json::to_vec(refusal)?;
-    line.push(b'\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(audit)?;
-    file.write_all(&line)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

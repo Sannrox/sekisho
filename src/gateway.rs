@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, Implementation, InitializeResult, ListToolsResult,
@@ -21,9 +21,11 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
+use crate::audit::{CallAudit, CallEvent, Decision, traceparent};
 use crate::config::{McpConfig, PolicyConfig, UpstreamConfig};
 use crate::exchange::Exchanger;
-use crate::policy::{AgentPolicy, PolicyFile, Refusal, agent_id, audit_refusal};
+use crate::metrics::Metrics;
+use crate::policy::{AgentPolicy, PolicyFile, agent_id};
 use crate::registry::{self, Registry};
 use crate::verifier::{CallerToken, Principal};
 
@@ -112,52 +114,144 @@ pub struct Gateway {
     federation: Arc<Federation>,
     policy: Arc<PolicyConfig>,
     exchanger: Arc<Exchanger>,
+    audit: Arc<CallAudit>,
+    metrics: Arc<Metrics>,
+}
+
+/// Why a call did not produce an upstream answer.
+struct Refused {
+    decision: Decision,
+    reason: String,
+    error: McpError,
+}
+
+impl Refused {
+    fn denied(tool: &str, reason: &str) -> Self {
+        Self {
+            decision: Decision::Denied,
+            reason: reason.into(),
+            error: McpError::invalid_params(format!("tool {tool} is not allowed: {reason}"), None),
+        }
+    }
+
+    fn failed(reason: &str, error: McpError) -> Self {
+        Self {
+            decision: Decision::Failed,
+            reason: reason.into(),
+            error,
+        }
+    }
 }
 
 impl Gateway {
-    pub fn new(federation: Arc<Federation>, policy: PolicyConfig, exchanger: Exchanger) -> Self {
+    pub fn new(
+        federation: Arc<Federation>,
+        policy: PolicyConfig,
+        exchanger: Exchanger,
+        audit: CallAudit,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         Self {
             federation,
             policy: Arc::new(policy),
             exchanger: Arc::new(exchanger),
+            audit: Arc::new(audit),
+            metrics,
         }
     }
 
-    /// The caller's agent and its policy, loaded fresh. Fails closed when
-    /// the principal is missing or the policy file cannot be loaded.
-    fn caller(
-        &self,
-        context: &RequestContext<RoleServer>,
-    ) -> Result<(Principal, Option<AgentPolicy>), McpError> {
-        let principal = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<Principal>())
-            .cloned()
-            .ok_or_else(|| McpError::internal_error("request has no verified principal", None))?;
+    /// The caller's agent policy, loaded fresh. Fails closed when the policy
+    /// file cannot be loaded; a malformed actor matches no agent.
+    fn agent_policy(&self, principal: &Principal) -> Result<Option<AgentPolicy>, McpError> {
         let file = PolicyFile::load(&self.policy.file).map_err(|error| {
             eprintln!("{error}");
             McpError::internal_error("agent policy is unavailable", None)
         })?;
-        // A malformed actor matches no agent, so it is refused below.
-        let agent = agent_id(&principal).and_then(|id| file.agent(&id).cloned());
-        Ok((principal, agent))
+        Ok(agent_id(principal).and_then(|id| file.agent(&id).cloned()))
     }
 
-    fn refuse(&self, principal: &Principal, tool: &str, reason: &str) -> McpError {
-        let refusal = Refusal {
-            at_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |at| at.as_millis()),
-            subject: principal.subject.clone(),
-            agent: agent_id(principal).unwrap_or_else(|| "<malformed act>".into()),
-            tool: tool.into(),
-            reason: reason.into(),
-        };
-        if let Err(error) = audit_refusal(&self.policy.audit_file, &refusal) {
-            eprintln!("recording refusal failed: {error}");
+    /// Policy, registry, exchange and upstream call for one tool call.
+    /// Returns the response and its encoded size.
+    async fn forward(
+        &self,
+        request: CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+        principal: Option<&Principal>,
+        trace_id: &str,
+    ) -> Result<(CallToolResponse, usize), Refused> {
+        let tool = request.name.to_string();
+        let principal = principal.ok_or_else(|| Refused::denied(&tool, "no verified principal"))?;
+        let agent = self
+            .agent_policy(principal)
+            .map_err(|error| Refused {
+                decision: Decision::Denied,
+                reason: "agent policy is unavailable".into(),
+                error,
+            })?
+            .ok_or_else(|| Refused::denied(&tool, "agent has no policy"))?;
+        if !agent.tools.contains(&tool) {
+            return Err(Refused::denied(&tool, "not in the agent allowlist"));
         }
-        McpError::invalid_params(format!("tool {tool} is not allowed: {reason}"), None)
+        let entry = self
+            .federation
+            .snapshot()
+            .tools
+            .get(&tool)
+            .filter(|entry| entry.served())
+            .cloned()
+            .ok_or_else(|| Refused::denied(&tool, "tool is not enabled"))?;
+        let upstream = self
+            .federation
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == entry.upstream)
+            .ok_or_else(|| Refused::denied(&tool, "tool upstream is not configured"))?;
+        let caller_token = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<CallerToken>())
+            .cloned()
+            .ok_or_else(|| Refused::denied(&tool, "request has no caller token"))?;
+        let delegated = self
+            .exchanger
+            .token(crate::exchange::Request {
+                caller_token: &caller_token.0,
+                agent: &agent.id,
+                ceiling: &agent.ceiling,
+                audience: &upstream.audience,
+                tool: &entry.name,
+            })
+            .await
+            .map_err(|error| {
+                eprintln!("{error}");
+                match error {
+                    crate::exchange::ExchangeError::Failed(_) => Refused::failed(
+                        "token exchange failed",
+                        McpError::internal_error("token exchange failed", None),
+                    ),
+                    _ => Refused::denied(&tool, "token exchange refused"),
+                }
+            })?;
+        let traceparent = traceparent(trace_id);
+        let call = crate::upstream::call_tool(
+            upstream,
+            &entry.name,
+            request.arguments,
+            delegated,
+            &traceparent,
+        );
+        // A cancelled or disconnected caller drops the upstream call, which
+        // closes its connection.
+        let result = tokio::select! {
+            result = call => result.map_err(|error| {
+                Refused::failed("upstream call failed", McpError::internal_error(error.to_string(), None))
+            })?,
+            () = context.ct.cancelled() => {
+                return Err(Refused::failed("request cancelled", McpError::internal_error("request cancelled", None)));
+            }
+        };
+        let size = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
+        Ok((CallToolResponse::Complete(result), size))
     }
 }
 
@@ -176,7 +270,12 @@ impl ServerHandler for Gateway {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let (_, agent) = self.caller(&context)?;
+        let principal = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>())
+            .ok_or_else(|| McpError::internal_error("request has no verified principal", None))?;
+        let agent = self.agent_policy(principal)?;
         let allowed = |key: &str| {
             agent
                 .as_ref()
@@ -208,70 +307,46 @@ impl ServerHandler for Gateway {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let (principal, agent) = match self.caller(&context) {
-            Ok(caller) => caller,
-            Err(error) => {
-                // Still audit, under whatever principal the request carries.
-                if let Some(principal) = context
-                    .extensions
-                    .get::<axum::http::request::Parts>()
-                    .and_then(|parts| parts.extensions.get::<Principal>())
-                {
-                    self.refuse(principal, &request.name, "agent policy is unavailable");
-                }
-                return Err(error);
-            }
+        let started = Instant::now();
+        let parts = context.extensions.get::<axum::http::request::Parts>();
+        let trace_id = crate::audit::trace_id(
+            parts
+                .and_then(|parts| parts.headers.get("traceparent"))
+                .and_then(|value| value.to_str().ok()),
+        );
+        let principal = parts
+            .and_then(|parts| parts.extensions.get::<Principal>())
+            .cloned();
+        let tool = request.name.to_string();
+        let outcome = self
+            .forward(request, &context, principal.as_ref(), &trace_id)
+            .await;
+        let (decision, reason, response_bytes) = match &outcome {
+            Ok((_, size)) => (Decision::Allowed, None, Some(*size)),
+            Err(refused) => (refused.decision, Some(refused.reason.clone()), None),
         };
-        let Some(agent) = agent else {
-            return Err(self.refuse(&principal, &request.name, "agent has no policy"));
-        };
-        if !agent.tools.iter().any(|tool| *tool == request.name) {
-            return Err(self.refuse(&principal, &request.name, "not in the agent allowlist"));
-        }
-        let entry = self
-            .federation
-            .snapshot()
-            .tools
-            .get(request.name.as_ref())
-            .filter(|entry| entry.served())
-            .cloned()
-            .ok_or_else(|| {
-                McpError::invalid_params(format!("tool {} is not enabled", request.name), None)
-            })?;
-        let upstream = self
-            .federation
-            .upstreams
-            .iter()
-            .find(|upstream| upstream.name == entry.upstream)
-            .ok_or_else(|| McpError::internal_error("tool upstream is not configured", None))?;
-        let caller_token = context
-            .extensions
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<CallerToken>())
-            .cloned()
-            .ok_or_else(|| McpError::internal_error("request has no caller token", None))?;
-        let delegated = self
-            .exchanger
-            .token(crate::exchange::Request {
-                caller_token: &caller_token.0,
-                agent: &agent.id,
-                ceiling: &agent.ceiling,
-                audience: &upstream.audience,
-                tool: &entry.name,
-            })
-            .await
-            .map_err(|error| {
-                eprintln!("{error}");
-                self.refuse(&principal, &request.name, "token exchange failed")
-            })?;
-        // A cancelled or disconnected caller drops the upstream call, which
-        // closes its connection.
-        tokio::select! {
-            result = crate::upstream::call_tool(upstream, &entry.name, request.arguments, delegated) => result
-                .map(CallToolResponse::Complete)
-                .map_err(|error| McpError::internal_error(error.to_string(), None)),
-            () = context.ct.cancelled() => Err(McpError::internal_error("request cancelled", None)),
-        }
+        self.metrics.record_call(decision);
+        self.audit.record(&CallEvent {
+            at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |at| at.as_millis()),
+            trace_id,
+            subject: principal
+                .as_ref()
+                .map_or_else(String::new, |principal| principal.subject.clone()),
+            agent: principal
+                .as_ref()
+                .and_then(agent_id)
+                .unwrap_or_else(|| "<unknown>".into()),
+            tool,
+            decision,
+            reason,
+            latency_ms: started.elapsed().as_millis(),
+            response_bytes,
+        });
+        outcome
+            .map(|(response, _)| response)
+            .map_err(|refused| refused.error)
     }
 }
 

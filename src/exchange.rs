@@ -32,6 +32,10 @@ const CACHE_CAPACITY: usize = 10_000;
 pub enum ExchangeError {
     #[error("token exchange is not configured")]
     NotConfigured,
+    /// The issuer, or Sekisho's own checks, refused this exchange.
+    #[error("token exchange refused: {0}")]
+    Refused(String),
+    /// The issuer could not be reached or answered with an error.
     #[error("token exchange failed: {0}")]
     Failed(String),
 }
@@ -83,7 +87,7 @@ impl Exchanger {
         let config = self.config.as_ref().ok_or(ExchangeError::NotConfigured)?;
         // Upstream-supplied names must not smuggle extra scope values.
         if !scope_token(request.tool) || !request.ceiling.iter().all(|grant| scope_token(grant)) {
-            return Err(ExchangeError::Failed(
+            return Err(ExchangeError::Refused(
                 "tool name or ceiling grant is not a plain scope value".into(),
             ));
         }
@@ -123,11 +127,12 @@ impl Exchanger {
             .send()
             .await
             .map_err(|error| ExchangeError::Failed(error.without_url().to_string()))?;
-        if !response.status().is_success() {
-            return Err(ExchangeError::Failed(format!(
-                "issuer answered {}",
-                response.status()
-            )));
+        let status = response.status();
+        if status.is_client_error() {
+            return Err(ExchangeError::Refused(format!("issuer answered {status}")));
+        }
+        if !status.is_success() {
+            return Err(ExchangeError::Failed(format!("issuer answered {status}")));
         }
         let body: ExchangeResponse = response
             .json()

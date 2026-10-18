@@ -49,6 +49,13 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   issuer's `expires_in`; tokens without it are not cached. If the
   exchange fails, or `[exchange]` is not configured, the call is refused
   and audited; nothing broader is tried.
+- **Call audit.** Every tool call appends one JSON line to `[audit]
+  calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
+  `failed`), reason, latency, response size and trace id. Events never carry
+  tokens, arguments or results. The trace id comes from the caller's W3C
+  `traceparent`, or is generated, and the upstream call carries it in a new
+  `traceparent` span so engine receipts link back. `/metrics` counts calls
+  by decision (`sekisho_tool_calls_total`).
 
   ```sh
   sekisho --config sekisho.toml registry list
@@ -61,7 +68,7 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   and grant ceiling (see `agents.example.toml`). The agent is the token's
   outermost `act` actor, or the subject when there is none. Agents see and
   call only allowed tools; other calls are refused before forwarding and
-  recorded in the policy audit file. The file is read on every call, so an
+  audited. The file is read on every call, so an
   edit applies to the next one. A missing or unreadable file refuses every
   call. Engines enforce the user's grants intersected with the ceiling
   through the delegated token from per-call token exchange.

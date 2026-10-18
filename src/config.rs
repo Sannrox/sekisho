@@ -32,6 +32,8 @@ pub struct Config {
     pub registry: RegistryConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
     /// Per-call token exchange. Without it, tool calls are refused.
     #[serde(default)]
     pub exchange: Option<ExchangeConfig>,
@@ -84,15 +86,28 @@ fn default_lifetime_secs() -> u64 {
 pub struct PolicyConfig {
     /// Read on every call; unreadable means every call is refused.
     pub file: PathBuf,
-    /// Refused calls, one JSON line each.
-    pub audit_file: PathBuf,
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             file: "agents.toml".into(),
-            audit_file: "agent-refusals.jsonl".into(),
+        }
+    }
+}
+
+/// Tool-call audit ([`crate::audit`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// One JSON line per tool call, allowed or not.
+    pub calls_file: PathBuf,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            calls_file: "calls.jsonl".into(),
         }
     }
 }
@@ -177,7 +192,7 @@ impl Config {
         config.registry.file = base.join(&config.registry.file);
         config.registry.audit_file = base.join(&config.registry.audit_file);
         config.policy.file = base.join(&config.policy.file);
-        config.policy.audit_file = base.join(&config.policy.audit_file);
+        config.audit.calls_file = base.join(&config.audit.calls_file);
         if let Some(exchange) = &mut config.exchange {
             exchange.client_secret_file = base.join(&exchange.client_secret_file);
         }

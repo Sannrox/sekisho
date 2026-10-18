@@ -81,7 +81,8 @@ async fn a_failed_exchange_refuses_the_call() {
         stack.seen.lock().unwrap().is_empty(),
         "nothing reached the engine"
     );
-    let audit = std::fs::read_to_string(&stack.config.policy.audit_file).unwrap();
+    let audit = std::fs::read_to_string(&stack.config.audit.calls_file).unwrap();
     assert!(audit.contains("token exchange failed"), "{audit}");
+    assert!(audit.contains("\"decision\":\"failed\""), "{audit}");
     let _ = client.cancel().await;
 }

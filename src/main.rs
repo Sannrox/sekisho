@@ -143,9 +143,10 @@ fn registry_command(config: &Config, command: RegistryCommand) -> Result<()> {
 
 async fn serve(config: &Config) -> Result<()> {
     let verifier = Verifier::from_config(&config.verifier)?;
+    let metrics = Arc::new(sekisho::metrics::Metrics::default());
     let state = Arc::new(AppState {
         verifier,
-        metrics: Default::default(),
+        metrics: metrics.clone(),
     });
     let shutdown = tokio_util::sync::CancellationToken::new();
     let federation = Arc::new(Federation::new(
@@ -164,6 +165,8 @@ async fn serve(config: &Config) -> Result<()> {
         federation,
         config.policy.clone(),
         sekisho::exchange::Exchanger::new(config.exchange.clone()),
+        sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+        metrics,
     );
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)

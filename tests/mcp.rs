@@ -45,6 +45,8 @@ async fn start() -> Running {
         federation,
         config.policy.clone(),
         sekisho::exchange::Exchanger::new(None),
+        sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+        Default::default(),
     );
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -215,6 +217,8 @@ async fn configured_browser_origins_pass_cors_preflight() {
         federation,
         config.policy.clone(),
         sekisho::exchange::Exchanger::new(None),
+        sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+        Default::default(),
     );
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

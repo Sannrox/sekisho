@@ -28,7 +28,7 @@ async fn agent_outside_its_allowlist_is_refused_and_audited_until_the_list_chang
         "{error}"
     );
 
-    let audit = std::fs::read_to_string(&stack.config.policy.audit_file).unwrap();
+    let audit = std::fs::read_to_string(&stack.config.audit.calls_file).unwrap();
     let record: serde_json::Value = serde_json::from_str(audit.lines().next().unwrap()).unwrap();
     assert_eq!(record["agent"], AGENT);
     assert_eq!(record["subject"], "user-1");
@@ -60,7 +60,7 @@ async fn missing_or_broken_policy_refuses_every_call() {
     assert!(client.list_all_tools().await.is_err());
     std::fs::write(&stack.config.policy.file, "not = [toml").unwrap();
     assert!(client.call_tool(echo_call("hi")).await.is_err());
-    let audit = std::fs::read_to_string(&stack.config.policy.audit_file).unwrap();
+    let audit = std::fs::read_to_string(&stack.config.audit.calls_file).unwrap();
     assert!(audit.contains("agent policy is unavailable"), "{audit}");
     let _ = client.cancel().await;
 }
