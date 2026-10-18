@@ -1,0 +1,12 @@
+# Copy to sekisho.toml. Relative paths resolve from this file's directory.
+listen = "127.0.0.1:8090"
+
+[verifier]
+kind = "jwks"                         # or "static" (development, loopback only)
+issuer = "https://issuer.example.test"
+audience = "sekisho"
+jwks_file = "jwks.json"               # local file; Sekisho never fetches keys
+
+# [verifier]
+# kind = "static"
+# token_file = "dev-token"            # compared in constant time
