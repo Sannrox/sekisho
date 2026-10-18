@@ -30,6 +30,7 @@ impl Drop for Running {
 
 async fn start() -> Running {
     let fixture = Fixture::new();
+    fixture.write("agents.toml", "");
     let config = Config::load(&fixture.jwks_config("127.0.0.1:0", &[("k1", &key(1))])).unwrap();
     let state = Arc::new(AppState {
         verifier: Verifier::from_config(&config.verifier).unwrap(),
@@ -40,7 +41,13 @@ async fn start() -> Running {
         Vec::new(),
         config.registry.file.clone(),
     ));
-    let app = router(state, &config.mcp, federation, shutdown.clone());
+    let app = router(
+        state,
+        &config.mcp,
+        federation,
+        config.policy.clone(),
+        shutdown.clone(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let stop = shutdown.clone();
@@ -205,7 +212,13 @@ async fn configured_browser_origins_pass_cors_preflight() {
         Vec::new(),
         config.registry.file.clone(),
     ));
-    let app = router(state, &config.mcp, federation, shutdown.clone());
+    let app = router(
+        state,
+        &config.mcp,
+        federation,
+        config.policy.clone(),
+        shutdown.clone(),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let stop = shutdown.clone();

@@ -47,6 +47,14 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   sekisho --config sekisho.toml registry approve ontology.search --owner alice
   sekisho --config sekisho.toml registry rollback ontology.search --owner alice
   ```
+- **Agent allowlists.** `[policy] file` lists each agent's allowed tools
+  and grant ceiling (see `agents.example.toml`). The agent is the token's
+  outermost `act` actor, or the subject when there is none. Agents see and
+  call only allowed tools; other calls are refused before forwarding and
+  recorded in the policy audit file. The file is read on every call, so an
+  edit applies to the next one. A missing or unreadable file refuses every
+  call. Engines enforce the user's grants intersected with the ceiling
+  through the delegated token from per-call token exchange.
 - **Verifier.** `jwks` checks asymmetric JWTs (RS, PS, ES, EdDSA; never
   shared-secret HS) against a local JWKS file: `kid`, signature, issuer,
   audience, expiry and subject. `static` is one development token, compared

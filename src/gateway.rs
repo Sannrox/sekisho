@@ -21,8 +21,10 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{McpConfig, UpstreamConfig};
+use crate::config::{McpConfig, PolicyConfig, UpstreamConfig};
+use crate::policy::{AgentPolicy, PolicyFile, Refusal, agent_id, audit_refusal};
 use crate::registry::{self, Registry};
+use crate::verifier::Principal;
 
 /// Longest wait for one upstream's tool listing during a refresh.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -107,6 +109,46 @@ impl Federation {
 #[derive(Clone)]
 pub struct Gateway {
     federation: Arc<Federation>,
+    policy: Arc<PolicyConfig>,
+}
+
+impl Gateway {
+    /// The caller's agent and its policy, loaded fresh. Fails closed when
+    /// the principal is missing or the policy file cannot be loaded.
+    fn caller(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<(Principal, Option<AgentPolicy>), McpError> {
+        let principal = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<Principal>())
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("request has no verified principal", None))?;
+        let file = PolicyFile::load(&self.policy.file).map_err(|error| {
+            eprintln!("{error}");
+            McpError::internal_error("agent policy is unavailable", None)
+        })?;
+        // A malformed actor matches no agent, so it is refused below.
+        let agent = agent_id(&principal).and_then(|id| file.agent(&id).cloned());
+        Ok((principal, agent))
+    }
+
+    fn refuse(&self, principal: &Principal, tool: &str, reason: &str) -> McpError {
+        let refusal = Refusal {
+            at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |at| at.as_millis()),
+            subject: principal.subject.clone(),
+            agent: agent_id(principal).unwrap_or_else(|| "<malformed act>".into()),
+            tool: tool.into(),
+            reason: reason.into(),
+        };
+        if let Err(error) = audit_refusal(&self.policy.audit_file, &refusal) {
+            eprintln!("recording refusal failed: {error}");
+        }
+        McpError::invalid_params(format!("tool {tool} is not allowed: {reason}"), None)
+    }
 }
 
 impl ServerHandler for Gateway {
@@ -122,13 +164,19 @@ impl ServerHandler for Gateway {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let (_, agent) = self.caller(&context)?;
+        let allowed = |key: &str| {
+            agent
+                .as_ref()
+                .is_some_and(|agent| agent.tools.iter().any(|tool| tool == key))
+        };
         let registry = self.federation.snapshot();
         let tools = registry
             .tools
             .iter()
-            .filter(|(_, entry)| entry.served())
+            .filter(|(key, entry)| entry.served() && allowed(key))
             .map(|(key, entry)| {
                 let version = entry.approved_version();
                 let schema = match &version.input_schema {
@@ -150,6 +198,26 @@ impl ServerHandler for Gateway {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let (principal, agent) = match self.caller(&context) {
+            Ok(caller) => caller,
+            Err(error) => {
+                // Still audit, under whatever principal the request carries.
+                if let Some(principal) = context
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|parts| parts.extensions.get::<Principal>())
+                {
+                    self.refuse(principal, &request.name, "agent policy is unavailable");
+                }
+                return Err(error);
+            }
+        };
+        let Some(agent) = agent else {
+            return Err(self.refuse(&principal, &request.name, "agent has no policy"));
+        };
+        if !agent.tools.iter().any(|tool| *tool == request.name) {
+            return Err(self.refuse(&principal, &request.name, "not in the agent allowlist"));
+        }
         let entry = self
             .federation
             .snapshot()
@@ -181,6 +249,7 @@ impl ServerHandler for Gateway {
 pub fn service(
     config: &McpConfig,
     federation: Arc<Federation>,
+    policy: PolicyConfig,
     shutdown: CancellationToken,
 ) -> StreamableHttpService<Gateway, NeverSessionManager> {
     let http = StreamableHttpServerConfig::default()
@@ -191,10 +260,12 @@ pub fn service(
         .enforce_origin_validation()
         .with_max_request_body_bytes(config.max_request_bytes)
         .with_cancellation_token(shutdown);
+    let policy = Arc::new(policy);
     StreamableHttpService::new(
         move || {
             Ok(Gateway {
                 federation: federation.clone(),
+                policy: policy.clone(),
             })
         },
         Arc::new(NeverSessionManager::default()),

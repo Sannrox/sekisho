@@ -30,6 +30,8 @@ pub struct Config {
     pub mcp: McpConfig,
     #[serde(default)]
     pub registry: RegistryConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
     /// Upstream MCP servers whose tools the registry federates.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
@@ -51,6 +53,25 @@ impl Default for RegistryConfig {
             file: "registry.json".into(),
             audit_file: "registry-audit.jsonl".into(),
             refresh_interval_ms: 30_000,
+        }
+    }
+}
+
+/// Per-agent allowlists ([`crate::policy`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyConfig {
+    /// Read on every call; unreadable means every call is refused.
+    pub file: PathBuf,
+    /// Refused calls, one JSON line each.
+    pub audit_file: PathBuf,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            file: "agents.toml".into(),
+            audit_file: "agent-refusals.jsonl".into(),
         }
     }
 }
@@ -132,6 +153,8 @@ impl Config {
         }
         config.registry.file = base.join(&config.registry.file);
         config.registry.audit_file = base.join(&config.registry.audit_file);
+        config.policy.file = base.join(&config.policy.file);
+        config.policy.audit_file = base.join(&config.policy.audit_file);
         for upstream in &mut config.upstreams {
             if let Some(token_file) = &mut upstream.token_file {
                 *token_file = base.join(&*token_file);
