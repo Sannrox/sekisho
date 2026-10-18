@@ -41,13 +41,12 @@ async fn start() -> Running {
         Vec::new(),
         config.registry.file.clone(),
     ));
-    let app = router(
-        state,
-        &config.mcp,
+    let gateway = sekisho::gateway::Gateway::new(
         federation,
         config.policy.clone(),
-        shutdown.clone(),
+        sekisho::exchange::Exchanger::new(None),
     );
+    let app = router(state, &config.mcp, gateway, shutdown.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let stop = shutdown.clone();
@@ -212,13 +211,12 @@ async fn configured_browser_origins_pass_cors_preflight() {
         Vec::new(),
         config.registry.file.clone(),
     ));
-    let app = router(
-        state,
-        &config.mcp,
+    let gateway = sekisho::gateway::Gateway::new(
         federation,
         config.policy.clone(),
-        shutdown.clone(),
+        sekisho::exchange::Exchanger::new(None),
     );
+    let app = router(state, &config.mcp, gateway, shutdown.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     let stop = shutdown.clone();

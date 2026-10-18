@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::McpConfig;
 use crate::metrics::Metrics;
-use crate::verifier::{Principal, Rejection, Verifier};
+use crate::verifier::{CallerToken, Principal, Rejection, Verifier};
 
 pub struct AppState {
     pub verifier: Verifier,
@@ -24,12 +24,24 @@ pub struct AppState {
 impl AppState {
     /// Verify the `Authorization: Bearer` header and count the outcome.
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Principal, Rejection> {
+        self.authenticate_token(headers)
+            .map(|(principal, _)| principal)
+    }
+
+    /// Like [`Self::authenticate`], also returning the presented token.
+    pub fn authenticate_token(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<(Principal, CallerToken), Rejection> {
         let result = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
             .ok_or(Rejection::Malformed)
-            .and_then(|token| self.verifier.verify(token));
+            .and_then(|token| {
+                let principal = self.verifier.verify(token)?;
+                Ok((principal, CallerToken(token.to_string())))
+            });
         self.metrics.record(result.is_ok());
         result
     }
@@ -65,8 +77,7 @@ struct McpAuth {
 pub fn router(
     state: Arc<AppState>,
     mcp: &McpConfig,
-    federation: Arc<crate::gateway::Federation>,
-    policy: crate::config::PolicyConfig,
+    gateway: crate::gateway::Gateway,
     shutdown: CancellationToken,
 ) -> Router {
     let metadata = ProtectedResource {
@@ -88,10 +99,7 @@ pub fn router(
         async move { axum::Json(metadata) }
     });
     let mcp_service = Router::new()
-        .nest_service(
-            "/mcp",
-            crate::gateway::service(mcp, federation, policy, shutdown),
-        )
+        .nest_service("/mcp", crate::gateway::service(mcp, gateway, shutdown))
         .layer(middleware::from_fn_with_state(auth, require_bearer));
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
@@ -173,9 +181,10 @@ async fn require_bearer(
     mut request: Request,
     next: Next,
 ) -> Response {
-    match auth.state.authenticate(request.headers()) {
-        Ok(principal) => {
+    match auth.state.authenticate_token(request.headers()) {
+        Ok((principal, token)) => {
             request.extensions_mut().insert(principal);
+            request.extensions_mut().insert(token);
             next.run(request).await
         }
         Err(rejection) => (

@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod diagnostics;
+pub mod exchange;
 pub mod gateway;
 pub mod metrics;
 pub mod policy;
