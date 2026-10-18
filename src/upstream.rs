@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use axum::http::{HeaderName, HeaderValue};
+
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, JsonObject};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -34,10 +36,18 @@ pub fn timed_out(upstream: &UpstreamConfig) -> UpstreamError {
 async fn connect(
     upstream: &UpstreamConfig,
     bearer: Option<String>,
+    traceparent: Option<&str>,
 ) -> Result<RunningService<rmcp::RoleClient, ClientConfig>, UpstreamError> {
     let mut transport = StreamableHttpClientTransportConfig::with_uri(upstream.url.clone());
     if let Some(bearer) = bearer {
         transport = transport.auth_header(bearer);
+    }
+    if let Some(value) = traceparent.and_then(|value| HeaderValue::from_str(value).ok()) {
+        transport = transport.custom_headers(
+            [(HeaderName::from_static("traceparent"), value)]
+                .into_iter()
+                .collect(),
+        );
     }
     ClientConfig::default()
         .serve(StreamableHttpClientTransport::from_config(transport))
@@ -59,7 +69,7 @@ pub async fn list_tools(
         .map(read_token)
         .transpose()
         .map_err(|e| error(upstream, e))?;
-    let client = connect(upstream, bearer).await?;
+    let client = connect(upstream, bearer, None).await?;
     let tools = client
         .list_all_tools()
         .await
@@ -84,8 +94,9 @@ pub async fn call_tool(
     tool: &str,
     arguments: Option<JsonObject>,
     delegated_token: String,
+    traceparent: &str,
 ) -> Result<CallToolResult, UpstreamError> {
-    let client = connect(upstream, Some(delegated_token)).await?;
+    let client = connect(upstream, Some(delegated_token), Some(traceparent)).await?;
     let mut params = CallToolRequestParams::new(tool.to_string());
     params.arguments = arguments;
     let result = client

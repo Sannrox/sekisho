@@ -6,6 +6,7 @@
 //! makes no network calls of its own; the JWKS comes from a local file, so it
 //! starts and verifies tokens offline.
 
+pub mod audit;
 pub mod config;
 pub mod diagnostics;
 pub mod exchange;

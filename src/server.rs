@@ -18,7 +18,7 @@ use crate::verifier::{CallerToken, Principal, Rejection, Verifier};
 
 pub struct AppState {
     pub verifier: Verifier,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {

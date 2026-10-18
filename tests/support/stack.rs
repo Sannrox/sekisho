@@ -31,6 +31,7 @@ const ISSUER_KID: &str = "issuer-2";
 struct Upstream {
     description: Arc<Mutex<String>>,
     seen: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    traceparents: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 /// Claims of a delegated token, if signed by the issuer for this audience.
@@ -88,6 +89,13 @@ impl ServerHandler for Upstream {
                     .is_some_and(|scope| scope.split(' ').any(|s| s == wanted))
             })
             .ok_or_else(|| ErrorData::invalid_params("token is not for this tool", None))?;
+        let traceparent = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.headers.get("traceparent"))
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        self.traceparents.lock().unwrap().push(traceparent);
         self.seen.lock().unwrap().push((token, claims));
         let text = request
             .arguments
@@ -135,6 +143,8 @@ pub struct Stack {
     pub description: Arc<Mutex<String>>,
     /// (delegated token, claims) of every call the upstream accepted.
     pub seen: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    /// `traceparent` header of every call the upstream accepted.
+    pub traceparents: Arc<Mutex<Vec<Option<String>>>>,
     /// Makes the fake issuer refuse every exchange.
     pub issuer_down: Arc<std::sync::atomic::AtomicBool>,
     stop: CancellationToken,
@@ -154,9 +164,11 @@ impl Stack {
         let stop = CancellationToken::new();
         let description = Arc::new(Mutex::new("Echo v1".to_string()));
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let traceparents = Arc::new(Mutex::new(Vec::new()));
         let upstream = Upstream {
             description: description.clone(),
             seen: seen.clone(),
+            traceparents: traceparents.clone(),
         };
         let upstream_service = StreamableHttpService::new(
             move || Ok(upstream.clone()),
@@ -202,6 +214,8 @@ impl Stack {
             federation,
             config.policy.clone(),
             sekisho::exchange::Exchanger::new(config.exchange.clone()),
+            sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+            Default::default(),
         );
         let app = router(state, &config.mcp, gateway, stop.clone());
         let address = serve_on_loopback(app, stop.clone()).await;
@@ -211,6 +225,7 @@ impl Stack {
             config,
             description,
             seen,
+            traceparents,
             issuer_down,
             stop,
             _fixture: fixture,
@@ -222,6 +237,16 @@ impl Stack {
         &self,
         extra: serde_json::Value,
     ) -> RunningService<RoleClient, ClientConfig> {
+        self.client_with(extra, std::collections::HashMap::new())
+            .await
+    }
+
+    /// Like [`Self::client`], sending `headers` on every request.
+    pub async fn client_with(
+        &self,
+        extra: serde_json::Value,
+        headers: std::collections::HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) -> RunningService<RoleClient, ClientConfig> {
         let bearer = token("k1", &key(1), claims(extra));
         ClientConfig::default()
             .serve(StreamableHttpClientTransport::from_config(
@@ -229,7 +254,8 @@ impl Stack {
                     "http://{}/mcp",
                     self.address
                 ))
-                .auth_header(bearer),
+                .auth_header(bearer)
+                .custom_headers(headers),
             ))
             .await
             .unwrap()
@@ -309,7 +335,10 @@ fn issuer(down: Arc<std::sync::atomic::AtomicBool>) -> axum::Router {
                         .is_some_and(|value| value.as_bytes() == expected.as_bytes());
                     let grant_ok = form.get("grant_type").map(String::as_str)
                         == Some("urn:ietf:params:oauth:grant-type:token-exchange");
-                    if down.load(std::sync::atomic::Ordering::SeqCst) || !client_ok || !grant_ok {
+                    if down.load(std::sync::atomic::Ordering::SeqCst) {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
+                    }
+                    if !client_ok || !grant_ok {
                         return (StatusCode::BAD_REQUEST, "invalid_grant").into_response();
                     }
                     let x = base64::engine::general_purpose::URL_SAFE_NO_PAD

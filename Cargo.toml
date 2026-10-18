@@ -23,6 +23,7 @@ tokio-util = "0.7.20"
 toml = "1.1.8"
 tower-http = { version = "0.7.1", features = ["cors"] }
 url = "2.5.8"
+uuid = { version = "1.28.0", features = ["v4"] }
 
 [dev-dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "form"] }
