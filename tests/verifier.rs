@@ -70,7 +70,7 @@ fn static_token_is_development_only() {
     fixture.write("token", "dev-token-123\n");
     let remote = fixture.write(
         "remote.toml",
-        "listen = \"0.0.0.0:8080\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n",
+        &format!("listen = \"0.0.0.0:8080\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n{MCP_SECTION}"),
     );
     assert!(
         Config::load(&remote)
@@ -80,7 +80,7 @@ fn static_token_is_development_only() {
     );
     let local = fixture.write(
         "local.toml",
-        "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n",
+        &format!("listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n{MCP_SECTION}"),
     );
     let verifier = Verifier::from_config(&Config::load(&local).unwrap().verifier).unwrap();
     assert!(verifier.verify("dev-token-123").is_ok());
@@ -96,7 +96,7 @@ fn refuses_keys_not_meant_for_signature_verification() {
     let config = fixture.write(
         "sekisho.toml",
         &format!(
-            "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"jwks\"\nissuer = \"{ISSUER}\"\naudience = \"{AUDIENCE}\"\njwks_file = \"jwks.json\"\n"
+            "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"jwks\"\nissuer = \"{ISSUER}\"\naudience = \"{AUDIENCE}\"\njwks_file = \"jwks.json\"\n{MCP_SECTION}"
         ),
     );
     let verifier = Verifier::from_config(&Config::load(&config).unwrap().verifier).unwrap();

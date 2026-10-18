@@ -27,6 +27,39 @@ pub struct Config {
     /// Address to bind. Port 0 picks a free port; `serve` prints the bound one.
     pub listen: SocketAddr,
     pub verifier: VerifierConfig,
+    pub mcp: McpConfig,
+}
+
+/// The MCP endpoint at `/mcp` and its OAuth protected-resource metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Canonical URL of this endpoint, as clients reach it (RFC 9728 `resource`).
+    pub resource: String,
+    /// Authorization servers that issue tokens for this resource.
+    pub authorization_servers: Vec<String>,
+    /// `Host` values accepted on `/mcp`. Default: loopback names only, which
+    /// blocks DNS rebinding against a local server.
+    #[serde(default = "loopback_hosts")]
+    pub allowed_hosts: Vec<String>,
+    /// Browser `Origin` values accepted on `/mcp`, with scheme and port
+    /// (`:*` for any port). Requests without `Origin` pass. Empty refuses
+    /// every request that carries an `Origin`.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Largest request body. Larger requests get 413 before any parsing.
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
+}
+
+fn loopback_hosts() -> Vec<String> {
+    ["localhost", "127.0.0.1", "[::1]"]
+        .map(String::from)
+        .to_vec()
+}
+
+fn default_max_request_bytes() -> usize {
+    1024 * 1024
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +97,16 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.mcp.resource.trim().is_empty() || self.mcp.authorization_servers.is_empty() {
+            return Err(ConfigError::Invalid(
+                "mcp needs a resource URL and at least one authorization server".into(),
+            ));
+        }
+        if self.mcp.max_request_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "mcp max_request_bytes must be positive".into(),
+            ));
+        }
         match &self.verifier {
             VerifierConfig::Jwks {
                 issuer, audience, ..

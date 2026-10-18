@@ -14,12 +14,21 @@ Engines keep enforcing their own authorization, and Sekisho never holds a privil
 
 ```sh
 cp sekisho.example.toml sekisho.toml   # point jwks_file at your issuer's JWKS
-sekisho serve --config sekisho.toml    # prints "listening on <addr>"
+sekisho serve --config sekisho.toml    # prints "listening on <addr>"; MCP at /mcp
 curl http://127.0.0.1:8090/healthz
 curl http://127.0.0.1:8090/metrics
 sekisho diagnostics --config sekisho.toml > bundle.json
 ```
 
+- **MCP endpoint.** `/mcp` serves MCP over Streamable HTTP: stateless
+  2026-07-28 by default, with negotiated fallback to 2025-11-25. Every
+  request needs a bearer token. A missing or invalid token gets 401 with
+  `WWW-Authenticate: Bearer resource_metadata="…"`, and the OAuth
+  protected-resource metadata (RFC 9728) is at
+  `/.well-known/oauth-protected-resource/mcp`. `Host` and `Origin` are
+  checked against `[mcp]` allowlists, and a body above `max_request_bytes`
+  gets 413 before it is parsed. A client that cancels a request or
+  disconnects cancels the work (SDK request cancellation).
 - **Verifier.** `jwks` checks asymmetric JWTs (RS, PS, ES, EdDSA; never
   shared-secret HS) against a local JWKS file: `kid`, signature, issuer,
   audience, expiry and subject. `static` is one development token, compared
