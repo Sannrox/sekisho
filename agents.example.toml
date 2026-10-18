@@ -1,0 +1,6 @@
+# Copy to agents.toml. The agent is the token's outermost `act` actor, or its
+# subject when there is none. An agent without an entry may call nothing.
+[[agents]]
+id = "assistant-7"
+tools = ["ontology.search"]            # registry keys <upstream>.<tool>
+ceiling = ["read"]                     # most this agent may ever use

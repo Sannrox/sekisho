@@ -66,6 +66,7 @@ pub fn router(
     state: Arc<AppState>,
     mcp: &McpConfig,
     federation: Arc<crate::gateway::Federation>,
+    policy: crate::config::PolicyConfig,
     shutdown: CancellationToken,
 ) -> Router {
     let metadata = ProtectedResource {
@@ -87,7 +88,10 @@ pub fn router(
         async move { axum::Json(metadata) }
     });
     let mcp_service = Router::new()
-        .nest_service("/mcp", crate::gateway::service(mcp, federation, shutdown))
+        .nest_service(
+            "/mcp",
+            crate::gateway::service(mcp, federation, policy, shutdown),
+        )
         .layer(middleware::from_fn_with_state(auth, require_bearer));
     Router::new()
         .route("/healthz", get(|| async { "ok\n" }))
