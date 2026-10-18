@@ -64,7 +64,7 @@ fn diagnostics_bundle_contains_no_secrets() {
     fixture.write("token", secret);
     let config = fixture.write(
         "sekisho.toml",
-        "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n",
+        &format!("listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n{MCP_SECTION}"),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_sekisho"))
         .arg("diagnostics")

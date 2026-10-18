@@ -11,6 +11,8 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
 pub const ISSUER: &str = "https://issuer.example.test";
 pub const AUDIENCE: &str = "sekisho";
+/// Appended to every test config.
+pub const MCP_SECTION: &str = "\n[mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://issuer.example.test\"]\n";
 
 pub fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -84,7 +86,7 @@ impl Fixture {
         self.write(
             "sekisho.toml",
             &format!(
-                "listen = \"{listen}\"\n\n[verifier]\nkind = \"jwks\"\nissuer = \"{ISSUER}\"\naudience = \"{AUDIENCE}\"\njwks_file = \"jwks.json\"\n"
+                "listen = \"{listen}\"\n\n[verifier]\nkind = \"jwks\"\nissuer = \"{ISSUER}\"\naudience = \"{AUDIENCE}\"\njwks_file = \"jwks.json\"\n\n[mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://issuer.example.test\"]\n"
             ),
         )
     }

@@ -10,3 +10,10 @@ jwks_file = "jwks.json"               # local file; Sekisho never fetches keys
 # [verifier]
 # kind = "static"
 # token_file = "dev-token"            # compared in constant time
+
+[mcp]
+resource = "http://127.0.0.1:8090/mcp"          # canonical URL clients use
+authorization_servers = ["https://issuer.example.test"]
+# allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]   # default; set your public host
+# allowed_origins = ["https://console.example.test:443"] # browsers only; default refuses any Origin
+# max_request_bytes = 1048576

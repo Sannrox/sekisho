@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve `/healthz` and `/metrics`. Prints `listening on <addr>` once bound.
+    /// Serve `/mcp`, its OAuth metadata, `/healthz` and `/metrics`. Prints `listening on <addr>` once bound.
     Serve {
         #[arg(long, default_value = "sekisho.toml")]
         config: PathBuf,
@@ -56,9 +56,12 @@ async fn serve(config: &Config) -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     println!("listening on {}", listener.local_addr()?);
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let app = router(state, &config.mcp, shutdown.clone());
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
+            shutdown.cancel();
         })
         .await?;
     Ok(())
