@@ -256,6 +256,9 @@ impl Stack {
             sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
             Default::default(),
         )
+        .guardrails(sekisho::guardrails::Guardrails::new(
+            config.guardrails.clone(),
+        ))
         .limits(sekisho::limits::Limiter::from_config(
             config.limits.clone(),
             config.cluster.state_dir.as_deref(),
@@ -300,6 +303,9 @@ impl Stack {
             sekisho::audit::CallAudit::new(self.config.audit.calls_file.clone()),
             Default::default(),
         )
+        .guardrails(sekisho::guardrails::Guardrails::new(
+            self.config.guardrails.clone(),
+        ))
         .limits(sekisho::limits::Limiter::from_config(
             self.config.limits.clone(),
             self.config.cluster.state_dir.as_deref(),

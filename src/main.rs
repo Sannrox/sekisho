@@ -169,6 +169,9 @@ async fn serve(config: &Config) -> Result<()> {
         metrics,
     )
     .progressive(config.mcp.progressive)
+    .guardrails(sekisho::guardrails::Guardrails::new(
+        config.guardrails.clone(),
+    ))
     .limits(sekisho::limits::Limiter::from_config(
         config.limits.clone(),
         config.cluster.state_dir.as_deref(),
