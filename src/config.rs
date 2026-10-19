@@ -21,7 +21,7 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address to bind. Port 0 picks a free port; `serve` prints the bound one.
@@ -34,6 +34,8 @@ pub struct Config {
     pub policy: PolicyConfig,
     #[serde(default)]
     pub audit: AuditConfig,
+    #[serde(default)]
+    pub limits: crate::limits::LimitsConfig,
     /// Per-call token exchange. Without it, tool calls are refused.
     #[serde(default)]
     pub exchange: Option<ExchangeConfig>,
@@ -209,6 +211,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.limits.validate().map_err(ConfigError::Invalid)?;
         if self.mcp.resource.trim().is_empty() || self.mcp.authorization_servers.is_empty() {
             return Err(ConfigError::Invalid(
                 "mcp needs a resource URL and at least one authorization server".into(),

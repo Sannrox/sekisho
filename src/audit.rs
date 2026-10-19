@@ -21,6 +21,8 @@ pub enum Decision {
     Denied,
     /// The token exchange or the upstream call failed operationally.
     Failed,
+    /// Refused by a rate limit; the caller may retry later.
+    Throttled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
