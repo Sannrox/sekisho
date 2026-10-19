@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod config;
 pub mod diagnostics;
+pub mod discovery;
 pub mod exchange;
 pub mod gateway;
 pub mod metrics;

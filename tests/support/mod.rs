@@ -97,3 +97,11 @@ impl Fixture {
         self.dir.path()
     }
 }
+
+/// Listed tools without the always-present `sekisho.*` meta-tools.
+pub fn upstream_tools(tools: Vec<rmcp::model::Tool>) -> Vec<rmcp::model::Tool> {
+    tools
+        .into_iter()
+        .filter(|tool| !tool.name.starts_with("sekisho."))
+        .collect()
+}

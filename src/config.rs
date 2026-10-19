@@ -147,6 +147,9 @@ pub struct McpConfig {
     /// Largest request body. Larger requests get 413 before any parsing.
     #[serde(default = "default_max_request_bytes")]
     pub max_request_bytes: usize,
+    /// List only the discovery meta-tools; agents find the rest by search.
+    #[serde(default)]
+    pub progressive: bool,
 }
 
 fn loopback_hosts() -> Vec<String> {
@@ -223,7 +226,8 @@ impl Config {
                     .name
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-            if !valid || !names.insert(&upstream.name) {
+            // `sekisho.*` names belong to the discovery meta-tools.
+            if !valid || upstream.name == "sekisho" || !names.insert(&upstream.name) {
                 return Err(ConfigError::Invalid(format!(
                     "upstream name {:?} must be unique and use letters, digits, - or _",
                     upstream.name
