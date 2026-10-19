@@ -54,11 +54,12 @@ impl CallAudit {
         let append = || -> std::io::Result<()> {
             let mut line = serde_json::to_vec(event)?;
             line.push(b'\n');
-            std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&self.file)?
-                .write_all(&line)
+                .open(&self.file)?;
+            file.write_all(&line)?;
+            file.sync_all()
         };
         if let Err(error) = append() {
             eprintln!("recording call audit event failed: {error}");

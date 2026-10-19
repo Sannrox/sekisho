@@ -32,6 +32,8 @@ struct Upstream {
     description: Arc<Mutex<String>>,
     seen: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     traceparents: Arc<Mutex<Vec<Option<String>>>>,
+    /// Set when a `hold` call has reached the upstream, before it sleeps.
+    hold_entered: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Claims of a delegated token, if signed by the issuer for this audience.
@@ -101,6 +103,11 @@ impl ServerHandler for Upstream {
             .arguments
             .and_then(|arguments| arguments.get("text")?.as_str().map(str::to_string))
             .unwrap_or_default();
+        if text == "hold" {
+            self.hold_entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
         Ok(CallToolResponse::Complete(CallToolResult::success(vec![
             ContentBlock::text(format!("echo {text}")),
         ])))
@@ -147,8 +154,33 @@ pub struct Stack {
     pub traceparents: Arc<Mutex<Vec<Option<String>>>>,
     /// Makes the fake issuer refuse every exchange.
     pub issuer_down: Arc<std::sync::atomic::AtomicBool>,
+    /// An upstream `hold` call has started sleeping.
+    pub hold_entered: Arc<std::sync::atomic::AtomicBool>,
     stop: CancellationToken,
     _fixture: Fixture,
+}
+
+/// A second replica sharing the stack's files. [`Replica::kill`] aborts the
+/// listener like process death.
+pub struct Replica {
+    pub address: String,
+    stop: CancellationToken,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Replica {
+    /// Cancel in-flight MCP calls, then drop the listener.
+    pub fn kill(self) {
+        self.stop.cancel();
+        self.server.abort();
+    }
+}
+
+impl Drop for Replica {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.server.abort();
+    }
 }
 
 impl Drop for Stack {
@@ -170,10 +202,12 @@ impl Stack {
         let description = Arc::new(Mutex::new("Echo v1".to_string()));
         let seen = Arc::new(Mutex::new(Vec::new()));
         let traceparents = Arc::new(Mutex::new(Vec::new()));
+        let hold_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let upstream = Upstream {
             description: description.clone(),
             seen: seen.clone(),
             traceparents: traceparents.clone(),
+            hold_entered: hold_entered.clone(),
         };
         let upstream_service = StreamableHttpService::new(
             move || Ok(upstream.clone()),
@@ -222,7 +256,10 @@ impl Stack {
             sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
             Default::default(),
         )
-        .limits(config.limits.clone());
+        .limits(sekisho::limits::Limiter::from_config(
+            config.limits.clone(),
+            config.cluster.state_dir.as_deref(),
+        ));
         let app = router(state, &config.mcp, gateway, stop.clone());
         let address = serve_on_loopback(app, stop.clone()).await;
         Self {
@@ -233,8 +270,50 @@ impl Stack {
             seen,
             traceparents,
             issuer_down,
+            hold_entered,
             stop,
             _fixture: fixture,
+        }
+    }
+
+    /// Another replica sharing this stack's files.
+    pub async fn extra_gateway(&self) -> Replica {
+        let stop = CancellationToken::new();
+        let federation = Arc::new(Federation::new(
+            self.config.upstreams.clone(),
+            self.config.registry.file.clone(),
+        ));
+        federation.refresh().await.unwrap();
+        tokio::spawn(
+            federation
+                .clone()
+                .run(Duration::from_millis(100), stop.clone()),
+        );
+        let state = Arc::new(AppState {
+            verifier: Verifier::from_config(&self.config.verifier).unwrap(),
+            metrics: Default::default(),
+        });
+        let gateway = sekisho::gateway::Gateway::new(
+            federation,
+            self.config.policy.clone(),
+            sekisho::exchange::Exchanger::new(self.config.exchange.clone()),
+            sekisho::audit::CallAudit::new(self.config.audit.calls_file.clone()),
+            Default::default(),
+        )
+        .limits(sekisho::limits::Limiter::from_config(
+            self.config.limits.clone(),
+            self.config.cluster.state_dir.as_deref(),
+        ));
+        let app = router(state, &self.config.mcp, gateway, stop.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Replica {
+            address,
+            stop,
+            server,
         }
     }
 
@@ -245,6 +324,22 @@ impl Stack {
     ) -> RunningService<RoleClient, ClientConfig> {
         self.client_with(extra, std::collections::HashMap::new())
             .await
+    }
+
+    /// Like [`Self::client`], talking to `address` instead of this stack.
+    pub async fn client_on(
+        &self,
+        address: &str,
+        extra: serde_json::Value,
+    ) -> RunningService<RoleClient, ClientConfig> {
+        let bearer = token("k1", &key(1), claims(extra));
+        ClientConfig::default()
+            .serve(StreamableHttpClientTransport::from_config(
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"))
+                    .auth_header(bearer),
+            ))
+            .await
+            .unwrap()
     }
 
     /// Like [`Self::client`], sending `headers` on every request.

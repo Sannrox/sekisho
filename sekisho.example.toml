@@ -42,6 +42,9 @@ client_secret_file = "exchange-secret"
 [audit]
 calls_file = "calls.jsonl"             # one line per tool call: caller, agent, tool, decision, trace id
 
+# [cluster]
+# state_dir = "cluster"                # shared rate-limit file; replicas point here
+
 [limits]                               # defaults shown
 agent = { rate_per_sec = 10.0, burst = 20.0 }
 user = { rate_per_sec = 20.0, burst = 40.0 }

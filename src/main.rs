@@ -169,7 +169,10 @@ async fn serve(config: &Config) -> Result<()> {
         metrics,
     )
     .progressive(config.mcp.progressive)
-    .limits(config.limits.clone());
+    .limits(sekisho::limits::Limiter::from_config(
+        config.limits.clone(),
+        config.cluster.state_dir.as_deref(),
+    ));
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

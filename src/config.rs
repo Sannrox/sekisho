@@ -36,6 +36,9 @@ pub struct Config {
     pub audit: AuditConfig,
     #[serde(default)]
     pub limits: crate::limits::LimitsConfig,
+    /// Shared replica state. Empty keeps rate limits in-process.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
     /// Per-call token exchange. Without it, tool calls are refused.
     #[serde(default)]
     pub exchange: Option<ExchangeConfig>,
@@ -96,6 +99,17 @@ impl Default for PolicyConfig {
             file: "agents.toml".into(),
         }
     }
+}
+
+/// Multi-replica shared state ([`crate::limits`] file-backed buckets).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterConfig {
+    /// Directory of the shared rate-limit file. MCP sessions are already
+    /// stateless; registry, policy and audit are already files. Replicas
+    /// point at the same paths.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Tool-call audit ([`crate::audit`]).
@@ -198,6 +212,9 @@ impl Config {
         config.registry.audit_file = base.join(&config.registry.audit_file);
         config.policy.file = base.join(&config.policy.file);
         config.audit.calls_file = base.join(&config.audit.calls_file);
+        if let Some(state_dir) = &mut config.cluster.state_dir {
+            *state_dir = base.join(&*state_dir);
+        }
         if let Some(exchange) = &mut config.exchange {
             exchange.client_secret_file = base.join(&exchange.client_secret_file);
         }

@@ -167,8 +167,8 @@ impl Gateway {
     }
 
     /// Rate limits and response and time caps.
-    pub fn limits(mut self, limits: LimitsConfig) -> Self {
-        self.limiter = Arc::new(Limiter::new(limits));
+    pub fn limits(mut self, limiter: Limiter) -> Self {
+        self.limiter = Arc::new(limiter);
         self
     }
 
@@ -230,7 +230,29 @@ impl Gateway {
             user: &principal.subject,
             tenant: principal.tenant.as_deref(),
         };
-        if let Err(wait) = self.limiter.admit(&caller, &tool, Instant::now()) {
+        let admitted = if self.limiter.is_shared() {
+            let limiter = Arc::clone(&self.limiter);
+            let agent_id = agent.id.clone();
+            let user = principal.subject.clone();
+            let tenant = principal.tenant.clone();
+            let tool = tool.clone();
+            tokio::task::spawn_blocking(move || {
+                limiter.admit(
+                    &Caller {
+                        agent: &agent_id,
+                        user: &user,
+                        tenant: tenant.as_deref(),
+                    },
+                    &tool,
+                    Instant::now(),
+                )
+            })
+            .await
+            .unwrap_or_else(|_| Err(Duration::from_secs(1)))
+        } else {
+            self.limiter.admit(&caller, &tool, Instant::now())
+        };
+        if let Err(wait) = admitted {
             // Round up so waiting exactly this long is enough.
             let retry_after_ms = wait.as_micros().div_ceil(1_000).max(1);
             return Err(Refused {
@@ -438,7 +460,8 @@ impl ServerHandler for Gateway {
             Err(refused) => (refused.decision, Some(refused.reason.clone()), None),
         };
         self.metrics.record_call(decision);
-        self.audit.record(&CallEvent {
+        let audit = Arc::clone(&self.audit);
+        let event = CallEvent {
             at_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |at| at.as_millis()),
@@ -455,7 +478,9 @@ impl ServerHandler for Gateway {
             reason,
             latency_ms: started.elapsed().as_millis(),
             response_bytes,
-        });
+        };
+        // Durable before the response; fsync stays off the worker.
+        let _ = tokio::task::spawn_blocking(move || audit.record(&event)).await;
         outcome
             .map(|(response, _)| response)
             .map_err(|refused| refused.error)

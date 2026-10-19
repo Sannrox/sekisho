@@ -62,7 +62,11 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   `throttled`. Responses above `max_response_bytes` are truncated, with a
   final text block saying so, and upstream calls longer than `max_call_ms`
   fail. Defaults (agent 10/s burst 20, user 20/s burst 40, tenant 100/s
-  burst 200, 1 MiB, 60 s) leave interactive use alone.
+  burst 200, 1 MiB, 60 s) leave interactive use alone. With `[cluster]
+  state_dir`, replicas share the buckets in `limits.json` under an exclusive
+  flock; a store error fails closed with a 1s retry. MCP sessions are
+  already stateless (2026-07-28); registry, policy and audit stay files.
+  Audit lines are fsynced before the response.
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
   `failed`), reason, latency, response size and trace id. Events never carry
