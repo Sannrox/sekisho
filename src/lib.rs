@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod exchange;
 pub mod gateway;
+pub mod limits;
 pub mod metrics;
 pub mod policy;
 pub mod registry;

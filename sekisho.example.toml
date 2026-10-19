@@ -41,3 +41,12 @@ client_secret_file = "exchange-secret"
 
 [audit]
 calls_file = "calls.jsonl"             # one line per tool call: caller, agent, tool, decision, trace id
+
+[limits]                               # defaults shown
+agent = { rate_per_sec = 10.0, burst = 20.0 }
+user = { rate_per_sec = 20.0, burst = 40.0 }
+tenant = { rate_per_sec = 100.0, burst = 200.0 }
+max_response_bytes = 1048576
+max_call_ms = 60000
+# [limits.costs]
+# "ontology.search" = 2.0

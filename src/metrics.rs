@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Metrics {
     accepted: AtomicU64,
     rejected: AtomicU64,
-    /// Tool calls by decision: allowed, denied, failed.
-    calls: [AtomicU64; 3],
+    /// Tool calls by decision: allowed, denied, failed, throttled.
+    calls: [AtomicU64; 4],
+    truncated: AtomicU64,
 }
 
 impl Metrics {
@@ -26,8 +27,13 @@ impl Metrics {
             Decision::Allowed => 0,
             Decision::Denied => 1,
             Decision::Failed => 2,
+            Decision::Throttled => 3,
         };
         self.calls[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_truncated(&self) {
+        self.truncated.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn render(&self, verifier: &str) -> String {
@@ -41,13 +47,18 @@ impl Metrics {
              # TYPE sekisho_tool_calls_total counter\n\
              sekisho_tool_calls_total{{decision=\"allowed\"}} {allowed}\n\
              sekisho_tool_calls_total{{decision=\"denied\"}} {denied}\n\
-             sekisho_tool_calls_total{{decision=\"failed\"}} {failed}\n",
+             sekisho_tool_calls_total{{decision=\"failed\"}} {failed}\n\
+             sekisho_tool_calls_total{{decision=\"throttled\"}} {throttled}\n\
+             # TYPE sekisho_truncated_responses_total counter\n\
+             sekisho_truncated_responses_total {truncated}\n",
             version = env!("CARGO_PKG_VERSION"),
             accepted = self.accepted.load(Ordering::Relaxed),
             rejected = self.rejected.load(Ordering::Relaxed),
             allowed = calls(0),
             denied = calls(1),
             failed = calls(2),
+            throttled = calls(3),
+            truncated = self.truncated.load(Ordering::Relaxed),
         )
     }
 }

@@ -56,6 +56,13 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   use. `invoke_tool` is an ordinary call of its target: same allowlist,
   token exchange and audit. With `[mcp] progressive = true`, `tools/list`
   returns only the meta-tools. Upstream name `sekisho` is reserved.
+- **Limits.** Token buckets per agent, user and tenant (from a verified
+  `tenant_id` claim), with per-tool cost weights. A call over any bucket is
+  refused before the token exchange with `retry_after_ms` and audited as
+  `throttled`. Responses above `max_response_bytes` are truncated, with a
+  final text block saying so, and upstream calls longer than `max_call_ms`
+  fail. Defaults (agent 10/s burst 20, user 20/s burst 40, tenant 100/s
+  burst 200, 1 MiB, 60 s) leave interactive use alone.
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
   `failed`), reason, latency, response size and trace id. Events never carry

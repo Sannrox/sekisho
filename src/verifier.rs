@@ -59,6 +59,8 @@ pub struct Principal {
     pub subject: String,
     /// The `act` (actor chain) claim as sent, for later authorization layers.
     pub actor: Option<serde_json::Value>,
+    /// Verified `tenant_id` claim, used for tenant rate limits.
+    pub tenant: Option<String>,
 }
 
 /// The caller's raw bearer token, kept only to exchange it per call.
@@ -87,6 +89,8 @@ struct Claims {
     sub: String,
     #[serde(default)]
     act: Option<serde_json::Value>,
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 impl Verifier {
@@ -199,6 +203,7 @@ impl Verifier {
                 Ok(Principal {
                     subject: claims.sub,
                     actor: claims.act,
+                    tenant: claims.tenant_id.filter(|tenant| !tenant.trim().is_empty()),
                 })
             }
             Self::Static { token } => {
@@ -206,6 +211,7 @@ impl Verifier {
                     Ok(Principal {
                         subject: "development".into(),
                         actor: None,
+                        tenant: None,
                     })
                 } else {
                     Err(Rejection::Invalid("static token does not match".into()))

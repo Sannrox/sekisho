@@ -168,7 +168,8 @@ async fn serve(config: &Config) -> Result<()> {
         sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
         metrics,
     )
-    .progressive(config.mcp.progressive);
+    .progressive(config.mcp.progressive)
+    .limits(config.limits.clone());
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

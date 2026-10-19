@@ -86,6 +86,7 @@ mod tests {
         Principal {
             subject: "user-1".into(),
             actor,
+            tenant: None,
         }
     }
 

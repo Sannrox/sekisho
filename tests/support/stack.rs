@@ -161,6 +161,11 @@ impl Stack {
     /// Upstream `tools` serving `echo`, Sekisho refreshing every 100 ms, and
     /// `agents_toml` as the agent policy file (`None`: no policy file).
     pub async fn start(agents_toml: Option<&str>) -> Self {
+        Self::start_with(agents_toml, "").await
+    }
+
+    /// Like [`Self::start`], appending `extra_toml` to the config.
+    pub async fn start_with(agents_toml: Option<&str>, extra_toml: &str) -> Self {
         let stop = CancellationToken::new();
         let description = Arc::new(Mutex::new("Echo v1".to_string()));
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -195,7 +200,7 @@ impl Stack {
             + &format!(
                 "\n[registry]\nfile = \"registry.json\"\naudit_file = \"audit.jsonl\"\nrefresh_interval_ms = 100\n\n[exchange]\ntoken_endpoint = \"http://{issuer_address}/token\"\nclient_id = \"sekisho\"\nclient_secret_file = \"client-secret\"\n\n[[upstreams]]\nname = \"tools\"\nurl = \"http://{upstream_address}/mcp\"\naudience = \"{ENGINE_AUDIENCE}\"\n"
             );
-        std::fs::write(&path, text).unwrap();
+        std::fs::write(&path, text + extra_toml).unwrap();
         let config = Config::load(&path).unwrap();
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
@@ -216,7 +221,8 @@ impl Stack {
             sekisho::exchange::Exchanger::new(config.exchange.clone()),
             sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
             Default::default(),
-        );
+        )
+        .limits(config.limits.clone());
         let app = router(state, &config.mcp, gateway, stop.clone());
         let address = serve_on_loopback(app, stop.clone()).await;
         Self {

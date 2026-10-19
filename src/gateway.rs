@@ -25,6 +25,7 @@ use crate::audit::{CallAudit, CallEvent, Decision, traceparent};
 use crate::config::{McpConfig, PolicyConfig, UpstreamConfig};
 use crate::discovery;
 use crate::exchange::Exchanger;
+use crate::limits::{Caller, Limiter, LimitsConfig, cap_response};
 use crate::metrics::Metrics;
 use crate::policy::{AgentPolicy, PolicyFile, agent_id};
 use crate::registry::{self, Registry};
@@ -118,6 +119,7 @@ pub struct Gateway {
     audit: Arc<CallAudit>,
     metrics: Arc<Metrics>,
     progressive: bool,
+    limiter: Arc<Limiter>,
 }
 
 /// Why a call did not produce an upstream answer.
@@ -160,7 +162,14 @@ impl Gateway {
             audit: Arc::new(audit),
             metrics,
             progressive: false,
+            limiter: Arc::new(Limiter::new(LimitsConfig::default())),
         }
+    }
+
+    /// Rate limits and response and time caps.
+    pub fn limits(mut self, limits: LimitsConfig) -> Self {
+        self.limiter = Arc::new(Limiter::new(limits));
+        self
     }
 
     /// List only the discovery meta-tools.
@@ -202,6 +211,7 @@ impl Gateway {
         context: &RequestContext<RoleServer>,
         principal: Option<&Principal>,
         trace_id: &str,
+        invalid_invoke: Option<&str>,
     ) -> Result<(CallToolResponse, usize), Refused> {
         let tool = request.name.to_string();
         let principal = principal.ok_or_else(|| Refused::denied(&tool, "no verified principal"))?;
@@ -213,6 +223,28 @@ impl Gateway {
                 error,
             })?
             .ok_or_else(|| Refused::denied(&tool, "agent has no policy"))?;
+        // Every call is charged, including meta-tools and calls the
+        // allowlist will refuse, so floods are throttled either way.
+        let caller = Caller {
+            agent: &agent.id,
+            user: &principal.subject,
+            tenant: principal.tenant.as_deref(),
+        };
+        if let Err(wait) = self.limiter.admit(&caller, &tool, Instant::now()) {
+            // Round up so waiting exactly this long is enough.
+            let retry_after_ms = wait.as_micros().div_ceil(1_000).max(1);
+            return Err(Refused {
+                decision: Decision::Throttled,
+                reason: format!("rate limited; retry after {retry_after_ms} ms"),
+                error: McpError::invalid_request(
+                    format!("rate limited; retry after {retry_after_ms} ms"),
+                    Some(serde_json::json!({ "retry_after_ms": retry_after_ms })),
+                ),
+            });
+        }
+        if let Some(reason) = invalid_invoke {
+            return Err(Refused::denied(&tool, reason));
+        }
         if tool == discovery::SEARCH || tool == discovery::SCHEMA {
             let visible = self.visible(Some(&agent));
             let field = |name| {
@@ -233,7 +265,13 @@ impl Gateway {
                 discovery::schema(&visible, &name)
                     .ok_or_else(|| Refused::denied(&name, "not in the agent allowlist"))?
             };
-            let result = CallToolResult::structured(answer);
+            let (result, truncated) = cap_response(
+                CallToolResult::structured(answer),
+                self.limiter.config().max_response_bytes,
+            );
+            if truncated {
+                self.metrics.record_truncated();
+            }
             let size = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
             return Ok((CallToolResponse::Complete(result), size));
         }
@@ -290,6 +328,12 @@ impl Gateway {
         );
         // A cancelled or disconnected caller drops the upstream call, which
         // closes its connection.
+        let limit = Duration::from_millis(self.limiter.config().max_call_ms);
+        let call = async move {
+            tokio::time::timeout(limit, call)
+                .await
+                .unwrap_or_else(|_| Err(crate::upstream::timed_out_call(upstream)))
+        };
         let result = tokio::select! {
             result = call => result.map_err(|error| {
                 Refused::failed("upstream call failed", McpError::internal_error(error.to_string(), None))
@@ -298,6 +342,10 @@ impl Gateway {
                 return Err(Refused::failed("request cancelled", McpError::internal_error("request cancelled", None)));
             }
         };
+        let (result, truncated) = cap_response(result, self.limiter.config().max_response_bytes);
+        if truncated {
+            self.metrics.record_truncated();
+        }
         let size = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
         Ok((CallToolResponse::Complete(result), size))
     }
@@ -376,13 +424,15 @@ impl ServerHandler for Gateway {
             .and_then(|parts| parts.extensions.get::<Principal>())
             .cloned();
         let tool = request.name.to_string();
-        let outcome = match invalid_invoke {
-            Some(reason) => Err(Refused::denied(&tool, reason)),
-            None => {
-                self.forward(request, &context, principal.as_ref(), &trace_id)
-                    .await
-            }
-        };
+        let outcome = self
+            .forward(
+                request,
+                &context,
+                principal.as_ref(),
+                &trace_id,
+                invalid_invoke,
+            )
+            .await;
         let (decision, reason, response_bytes) = match &outcome {
             Ok((_, size)) => (Decision::Allowed, None, Some(*size)),
             Err(refused) => (refused.decision, Some(refused.reason.clone()), None),
