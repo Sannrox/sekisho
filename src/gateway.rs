@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, Implementation, InitializeResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, InitializeResult,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit::{CallAudit, CallEvent, Decision, traceparent};
 use crate::config::{McpConfig, PolicyConfig, UpstreamConfig};
+use crate::discovery;
 use crate::exchange::Exchanger;
 use crate::metrics::Metrics;
 use crate::policy::{AgentPolicy, PolicyFile, agent_id};
@@ -116,6 +117,7 @@ pub struct Gateway {
     exchanger: Arc<Exchanger>,
     audit: Arc<CallAudit>,
     metrics: Arc<Metrics>,
+    progressive: bool,
 }
 
 /// Why a call did not produce an upstream answer.
@@ -157,7 +159,29 @@ impl Gateway {
             exchanger: Arc::new(exchanger),
             audit: Arc::new(audit),
             metrics,
+            progressive: false,
         }
+    }
+
+    /// List only the discovery meta-tools.
+    pub fn progressive(mut self, progressive: bool) -> Self {
+        self.progressive = progressive;
+        self
+    }
+
+    /// Enabled registry tools on this agent's allowlist, with the approved
+    /// version agents see.
+    fn visible(&self, agent: Option<&AgentPolicy>) -> Vec<(String, crate::registry::ToolVersion)> {
+        let Some(agent) = agent else {
+            return Vec::new();
+        };
+        self.federation
+            .snapshot()
+            .tools
+            .into_iter()
+            .filter(|(key, entry)| entry.served() && agent.tools.contains(key))
+            .map(|(key, entry)| (key, entry.approved_version().clone()))
+            .collect()
     }
 
     /// The caller's agent policy, loaded fresh. Fails closed when the policy
@@ -189,6 +213,30 @@ impl Gateway {
                 error,
             })?
             .ok_or_else(|| Refused::denied(&tool, "agent has no policy"))?;
+        if tool == discovery::SEARCH || tool == discovery::SCHEMA {
+            let visible = self.visible(Some(&agent));
+            let field = |name| {
+                request
+                    .arguments
+                    .as_ref()
+                    .and_then(|arguments| arguments.get(name))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            };
+            let answer = if tool == discovery::SEARCH {
+                let query =
+                    field("query").ok_or_else(|| Refused::denied(&tool, "query is required"))?;
+                discovery::search(&visible, &query)
+            } else {
+                let name =
+                    field("name").ok_or_else(|| Refused::denied(&tool, "name is required"))?;
+                discovery::schema(&visible, &name)
+                    .ok_or_else(|| Refused::denied(&name, "not in the agent allowlist"))?
+            };
+            let result = CallToolResult::structured(answer);
+            let size = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
+            return Ok((CallToolResponse::Complete(result), size));
+        }
         if !agent.tools.contains(&tool) {
             return Err(Refused::denied(&tool, "not in the agent allowlist"));
         }
@@ -276,38 +324,48 @@ impl ServerHandler for Gateway {
             .and_then(|parts| parts.extensions.get::<Principal>())
             .ok_or_else(|| McpError::internal_error("request has no verified principal", None))?;
         let agent = self.agent_policy(principal)?;
-        let allowed = |key: &str| {
-            agent
-                .as_ref()
-                .is_some_and(|agent| agent.tools.iter().any(|tool| tool == key))
-        };
-        let registry = self.federation.snapshot();
-        let tools = registry
-            .tools
-            .iter()
-            .filter(|(key, entry)| entry.served() && allowed(key))
-            .map(|(key, entry)| {
-                let version = entry.approved_version();
-                let schema = match &version.input_schema {
-                    serde_json::Value::Object(schema) => schema.clone(),
-                    _ => Default::default(),
-                };
-                Tool::new_with_raw(
-                    key.clone(),
-                    version.description.clone().map(Cow::Owned),
-                    Arc::new(schema),
-                )
-            })
-            .collect();
+        let mut tools = discovery::meta_tools();
+        if !self.progressive {
+            tools.extend(
+                self.visible(agent.as_ref())
+                    .into_iter()
+                    .map(|(key, version)| {
+                        let schema = match version.input_schema {
+                            serde_json::Value::Object(schema) => schema,
+                            _ => Default::default(),
+                        };
+                        Tool::new_with_raw(
+                            key,
+                            version.description.map(Cow::Owned),
+                            Arc::new(schema),
+                        )
+                    }),
+            );
+        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
+        mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let started = Instant::now();
+        // `invoke_tool` is a call of its target: same checks, same audit.
+        // A malformed one is refused and audited under the wrapper's name.
+        let mut invalid_invoke = None;
+        if request.name == discovery::INVOKE {
+            match discovery::invoke_target(request.arguments.as_ref()) {
+                None => invalid_invoke = Some("invoke_tool needs a name and object arguments"),
+                Some((name, _)) if name.starts_with("sekisho.") => {
+                    invalid_invoke = Some("invoke_tool cannot call a meta-tool");
+                }
+                Some((name, arguments)) => {
+                    request.name = name.into();
+                    request.arguments = arguments;
+                }
+            }
+        }
         let parts = context.extensions.get::<axum::http::request::Parts>();
         let trace_id = crate::audit::trace_id(
             parts
@@ -318,9 +376,13 @@ impl ServerHandler for Gateway {
             .and_then(|parts| parts.extensions.get::<Principal>())
             .cloned();
         let tool = request.name.to_string();
-        let outcome = self
-            .forward(request, &context, principal.as_ref(), &trace_id)
-            .await;
+        let outcome = match invalid_invoke {
+            Some(reason) => Err(Refused::denied(&tool, reason)),
+            None => {
+                self.forward(request, &context, principal.as_ref(), &trace_id)
+                    .await
+            }
+        };
         let (decision, reason, response_bytes) = match &outcome {
             Ok((_, size)) => (Decision::Allowed, None, Some(*size)),
             Err(refused) => (refused.decision, Some(refused.reason.clone()), None),

@@ -29,12 +29,12 @@ async fn tools_start_disabled_then_enable_approve_and_roll_back_without_restart(
         .await
     );
     let client = stack.client(serde_json::json!({})).await;
-    assert!(client.list_all_tools().await.unwrap().is_empty());
+    assert!(support::upstream_tools(client.list_all_tools().await.unwrap()).is_empty());
     assert!(client.call_tool(echo_call("hi")).await.is_err());
 
     // Enabled by the owner: served within the refresh interval, no restart.
     stack.enable_echo().await;
-    let listed = async || client.list_all_tools().await.unwrap();
+    let listed = async || support::upstream_tools(client.list_all_tools().await.unwrap());
     assert!(eventually(Duration::from_secs(5), async || !listed().await.is_empty()).await);
     let result = client.call_tool(echo_call("hi")).await.unwrap();
     assert!(format!("{result:?}").contains("echo hi"), "{result:?}");

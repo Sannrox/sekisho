@@ -21,7 +21,7 @@ async fn agent_outside_its_allowlist_is_refused_and_audited_until_the_list_chang
         .await;
     // The registry serves the tool, but this agent may not use it.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(client.list_all_tools().await.unwrap().is_empty());
+    assert!(support::upstream_tools(client.list_all_tools().await.unwrap()).is_empty());
     let error = client.call_tool(echo_call("hi")).await.unwrap_err();
     assert!(
         format!("{error}").contains("not in the agent allowlist"),

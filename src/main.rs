@@ -167,7 +167,8 @@ async fn serve(config: &Config) -> Result<()> {
         sekisho::exchange::Exchanger::new(config.exchange.clone()),
         sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
         metrics,
-    );
+    )
+    .progressive(config.mcp.progressive);
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

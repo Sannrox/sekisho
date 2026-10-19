@@ -88,7 +88,7 @@ async fn sdk_client_speaks_2026_07_28_statelessly() {
     let info = client.peer_info().unwrap();
     assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
     assert!(info.capabilities.tools.is_some());
-    assert!(client.list_all_tools().await.unwrap().is_empty());
+    assert!(support::upstream_tools(client.list_all_tools().await.unwrap()).is_empty());
     client.cancel().await.unwrap();
 }
 
@@ -106,7 +106,7 @@ async fn sdk_client_falls_back_to_2025_11_25() {
         info.server_info.as_ref().map(|server| server.name.as_str()),
         Some("sekisho")
     );
-    assert!(client.list_all_tools().await.unwrap().is_empty());
+    assert!(support::upstream_tools(client.list_all_tools().await.unwrap()).is_empty());
     client.cancel().await.unwrap();
 }
 

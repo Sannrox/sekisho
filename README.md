@@ -49,6 +49,13 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   issuer's `expires_in`; tokens without it are not cached. If the
   exchange fails, or `[exchange]` is not configured, the call is refused
   and audited; nothing broader is tried.
+- **Progressive discovery.** Three meta-tools are always listed:
+  `sekisho.search_tools` (every query word in a tool's name or
+  description), `sekisho.get_tool_schema`, and `sekisho.invoke_tool`
+  (`{name, arguments}`). They only ever show or reach tools the caller may
+  use. `invoke_tool` is an ordinary call of its target: same allowlist,
+  token exchange and audit. With `[mcp] progressive = true`, `tools/list`
+  returns only the meta-tools. Upstream name `sekisho` is reserved.
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
   `failed`), reason, latency, response size and trace id. Events never carry

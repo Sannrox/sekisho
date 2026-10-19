@@ -17,6 +17,7 @@ authorization_servers = ["https://issuer.example.test"]
 # allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]   # default; set your public host
 # allowed_origins = ["https://console.example.test:443"] # browsers only; default refuses any Origin
 # max_request_bytes = 1048576
+# progressive = false                                  # true: list only sekisho.* meta-tools
 
 [registry]
 file = "registry.json"                 # owner state; edit with `sekisho registry`
