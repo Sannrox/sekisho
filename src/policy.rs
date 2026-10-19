@@ -25,6 +25,9 @@ pub struct AgentPolicy {
     /// Grants the agent may use, at most.
     #[serde(default)]
     pub ceiling: Vec<String>,
+    /// Guardrail layer for this agent, over the tenant and default (#10).
+    #[serde(default)]
+    pub guardrails: Option<crate::guardrails::GuardrailPolicy>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

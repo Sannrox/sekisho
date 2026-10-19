@@ -36,6 +36,9 @@ pub struct Config {
     pub audit: AuditConfig,
     #[serde(default)]
     pub limits: crate::limits::LimitsConfig,
+    /// Runtime guardrails for tool arguments and results (#10).
+    #[serde(default)]
+    pub guardrails: crate::guardrails::GuardrailsConfig,
     /// Shared replica state. Empty keeps rate limits in-process.
     #[serde(default)]
     pub cluster: ClusterConfig,

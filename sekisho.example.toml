@@ -53,3 +53,12 @@ max_response_bytes = 1048576
 max_call_ms = 60000
 # [limits.costs]
 # "ontology.search" = 2.0
+
+[guardrails]                          # runtime screening of tool traffic; defaults shown
+# inbound = "annotate"                # annotate | redact | block | allow (tool results)
+# outbound = "block"                  # block | redact | allow (tool arguments; secrets and personal data)
+# max_result_bytes = 262144
+# [guardrails.tools."ontology.search"]   # per-tool layer, most specific
+# inbound = "block"
+# [guardrails.tenants."tenant-1"]        # per-tenant layer
+# outbound = "redact"

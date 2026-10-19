@@ -35,6 +35,9 @@ pub struct CallEvent {
     pub decision: Decision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Guardrail summary (direction, action, rule names; never payload, #10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guardrail: Option<String>,
     pub latency_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
