@@ -9,8 +9,12 @@
 //! throttled.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
@@ -83,8 +87,14 @@ impl Default for LimitsConfig {
 impl LimitsConfig {
     pub fn validate(&self) -> Result<(), String> {
         let rates = [self.agent, self.user, self.tenant];
-        // NaN fails both comparisons and is rejected.
-        let valid = |rate: &Rate| rate.rate_per_sec >= MIN_RATE && rate.burst >= 1.0;
+        // NaN fails the comparisons. Infinity must not land in the shared file
+        // (JSON encodes it as null and every later admit fails closed).
+        let valid = |rate: &Rate| {
+            rate.rate_per_sec.is_finite()
+                && rate.burst.is_finite()
+                && rate.rate_per_sec >= MIN_RATE
+                && rate.burst >= 1.0
+        };
         if !rates.iter().all(valid) {
             return Err(format!(
                 "limits need rate_per_sec >= {MIN_RATE} and burst >= 1"
@@ -98,7 +108,7 @@ impl LimitsConfig {
         if !self
             .costs
             .values()
-            .all(|cost| *cost > 0.0 && *cost <= smallest_burst)
+            .all(|cost| cost.is_finite() && *cost > 0.0 && *cost <= smallest_burst)
         {
             return Err("tool costs must be positive and at most the smallest burst".into());
         }
@@ -133,6 +143,8 @@ const TABLE_LIMIT: usize = 100_000;
 pub struct Limiter {
     config: LimitsConfig,
     buckets: Mutex<Buckets>,
+    /// Shared replica file. Process death releases the flock.
+    store: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -156,6 +168,23 @@ impl Limiter {
         Self {
             config,
             buckets: Mutex::default(),
+            store: None,
+        }
+    }
+
+    /// Rate-limit buckets in `path`, shared by replicas.
+    pub fn shared(config: LimitsConfig, path: impl Into<PathBuf>) -> Self {
+        Self {
+            config,
+            buckets: Mutex::default(),
+            store: Some(path.into()),
+        }
+    }
+
+    pub fn from_config(limits: LimitsConfig, state_dir: Option<&Path>) -> Self {
+        match state_dir {
+            Some(dir) => Self::shared(limits, dir.join("limits.json")),
+            None => Self::new(limits),
         }
     }
 
@@ -163,16 +192,17 @@ impl Limiter {
         &self.config
     }
 
+    pub(crate) fn is_shared(&self) -> bool {
+        self.store.is_some()
+    }
+
     /// Charge `tool`'s cost to every scope, or return how long to wait.
     pub fn admit(&self, caller: &Caller<'_>, tool: &str, now: Instant) -> Result<(), Duration> {
-        let cost = self.config.costs.get(tool).copied().unwrap_or(1.0);
-        let mut scopes = vec![
-            (Scope::Agent, caller.agent, self.config.agent),
-            (Scope::User, caller.user, self.config.user),
-        ];
-        if let Some(tenant) = caller.tenant {
-            scopes.push((Scope::Tenant, tenant, self.config.tenant));
+        if let Some(path) = &self.store {
+            return self.admit_file(path, caller, tool);
         }
+        let cost = self.cost(tool);
+        let scopes = self.scopes(caller);
         let mut buckets = self
             .buckets
             .lock()
@@ -224,6 +254,184 @@ impl Limiter {
             }
         }
         Ok(())
+    }
+
+    fn cost(&self, tool: &str) -> f64 {
+        self.config.costs.get(tool).copied().unwrap_or(1.0)
+    }
+
+    fn scopes<'a>(&'a self, caller: &'a Caller<'_>) -> Vec<(Scope, &'a str, Rate)> {
+        let mut scopes = vec![
+            (Scope::Agent, caller.agent, self.config.agent),
+            (Scope::User, caller.user, self.config.user),
+        ];
+        if let Some(tenant) = caller.tenant {
+            scopes.push((Scope::Tenant, tenant, self.config.tenant));
+        }
+        scopes
+    }
+
+    /// Shared-file buckets. `Instant` is ignored; wall time is [`SystemTime`].
+    /// IO failure fails closed with a 1s retry so a poisoned file cannot
+    /// open the limiter.
+    fn admit_file(&self, path: &Path, caller: &Caller<'_>, tool: &str) -> Result<(), Duration> {
+        self.admit_file_io(path, caller, tool)
+            .unwrap_or_else(|error| {
+                eprintln!("shared rate-limit store failed: {error}");
+                Err(Duration::from_secs(1))
+            })
+    }
+
+    fn admit_file_io(
+        &self,
+        path: &Path,
+        caller: &Caller<'_>,
+        tool: &str,
+    ) -> std::io::Result<Result<(), Duration>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Flock a sibling so process death cannot leave a half-written
+        // `limits.json`; the data file is replaced by rename.
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))?;
+        let _lock = FileLock::exclusive(lock)?;
+        let mut store: FileStore = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileStore::default(),
+            Err(error) => return Err(error),
+        };
+        let result = self.admit_store(&mut store, caller, tool, now_ms());
+        let out = serde_json::to_vec(&store)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let tmp = path.with_extension("tmp");
+        {
+            let mut tmp_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            tmp_file.write_all(&out)?;
+            tmp_file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            let _ = File::open(parent).and_then(|dir| dir.sync_all());
+        }
+        Ok(result)
+    }
+
+    fn admit_store(
+        &self,
+        store: &mut FileStore,
+        caller: &Caller<'_>,
+        tool: &str,
+        now_ms: u64,
+    ) -> Result<(), Duration> {
+        let cost = self.cost(tool);
+        let scopes = self.scopes(caller);
+        if store.buckets.len() > TABLE_LIMIT {
+            store.buckets.retain(|_, bucket| {
+                now_ms < bucket.full_at_ms
+                    || now_ms.saturating_sub(bucket.at_ms) < IDLE.as_millis() as u64
+            });
+        }
+        let mut wait = Duration::ZERO;
+        for (scope, key, rate) in &scopes {
+            let bucket = store
+                .buckets
+                .entry(file_key(*scope, key))
+                .or_insert(FileBucket {
+                    tokens: rate.burst,
+                    at_ms: now_ms,
+                    full_at_ms: now_ms,
+                });
+            if now_ms > bucket.at_ms {
+                let elapsed = (now_ms - bucket.at_ms) as f64 / 1000.0;
+                bucket.tokens = (bucket.tokens + elapsed * rate.rate_per_sec).min(rate.burst);
+                bucket.at_ms = now_ms;
+            }
+            let missing = cost - bucket.tokens;
+            if missing > 0.0 {
+                let seconds = missing / rate.rate_per_sec;
+                wait = wait.max(Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX));
+            }
+        }
+        if !wait.is_zero() {
+            return Err(wait);
+        }
+        for (scope, key, rate) in &scopes {
+            if let Some(bucket) = store.buckets.get_mut(&file_key(*scope, key)) {
+                bucket.tokens -= cost;
+                let refill = (rate.burst - bucket.tokens) / rate.rate_per_sec;
+                bucket.full_at_ms = Duration::try_from_secs_f64(refill)
+                    .ok()
+                    .and_then(|refill| now_ms.checked_add(refill.as_millis() as u64))
+                    .unwrap_or(now_ms.saturating_add(IDLE.as_millis() as u64 * 1_000));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct FileStore {
+    #[serde(default)]
+    buckets: BTreeMap<String, FileBucket>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileBucket {
+    tokens: f64,
+    at_ms: u64,
+    full_at_ms: u64,
+}
+
+fn file_key(scope: Scope, id: &str) -> String {
+    match scope {
+        Scope::Agent => format!("agent:{id}"),
+        Scope::User => format!("user:{id}"),
+        Scope::Tenant => format!("tenant:{id}"),
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Exclusive `flock` on an open file. Process death releases it.
+struct FileLock {
+    file: File,
+}
+
+impl FileLock {
+    fn exclusive(file: File) -> std::io::Result<Self> {
+        // SAFETY: `file` is an open fd; LOCK_EX blocks until this process holds it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` is still the fd we locked.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -355,6 +563,18 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_rates_are_rejected() {
+        let inf = LimitsConfig {
+            agent: Rate {
+                rate_per_sec: 1.0,
+                burst: f64::INFINITY,
+            },
+            ..LimitsConfig::default()
+        };
+        assert!(inf.validate().is_err());
+    }
+
+    #[test]
     fn oversized_responses_are_truncated_and_marked() {
         let big = CallToolResult::success(vec![ContentBlock::text("x".repeat(5_000))]);
         let (capped, truncated) = cap_response(big, 1_000);
@@ -364,5 +584,85 @@ mod tests {
         assert!(marker.contains("truncated from"), "{marker}");
         let small = CallToolResult::success(vec![ContentBlock::text("ok")]);
         assert!(!cap_response(small, 1_000).1);
+    }
+
+    #[test]
+    fn two_limiters_share_file_buckets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        let config = LimitsConfig {
+            agent: Rate {
+                rate_per_sec: 1.0,
+                burst: 2.0,
+            },
+            ..LimitsConfig::default()
+        };
+        let a = Limiter::shared(config.clone(), &path);
+        let b = Limiter::shared(config, &path);
+        let now = Instant::now();
+        assert!(a.admit(&caller(), "t", now).is_ok());
+        assert!(b.admit(&caller(), "t", now).is_ok());
+        assert!(a.admit(&caller(), "t", now).is_err());
+    }
+
+    #[test]
+    fn shared_file_serializes_concurrent_admits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        let config = LimitsConfig {
+            agent: Rate {
+                rate_per_sec: 0.001,
+                burst: 1.0,
+            },
+            ..LimitsConfig::default()
+        };
+        let a = Limiter::shared(config.clone(), &path);
+        let b = Limiter::shared(config, &path);
+        let ok = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for limiter in [&a, &b] {
+                scope.spawn(|| {
+                    if limiter.admit(&caller(), "t", Instant::now()).is_ok() {
+                        ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(ok.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(a.admit(&caller(), "t", Instant::now()).is_err());
+    }
+
+    #[test]
+    fn poisoned_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        std::fs::write(&path, "not-json").unwrap();
+        let limiter = Limiter::shared(LimitsConfig::default(), &path);
+        let wait = limiter.admit(&caller(), "t", Instant::now()).unwrap_err();
+        assert_eq!(wait, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn empty_existing_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        std::fs::write(&path, "").unwrap();
+        let limiter = Limiter::shared(LimitsConfig::default(), &path);
+        let wait = limiter.admit(&caller(), "t", Instant::now()).unwrap_err();
+        assert_eq!(wait, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn leftover_tmp_does_not_poison_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limits.json");
+        std::fs::write(path.with_extension("tmp"), "not-json").unwrap();
+        let limiter = Limiter::shared(LimitsConfig::default(), &path);
+        assert!(limiter.admit(&caller(), "t", Instant::now()).is_ok());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body).is_ok(),
+            "{body}"
+        );
     }
 }
