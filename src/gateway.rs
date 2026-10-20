@@ -184,6 +184,11 @@ impl Gateway {
         }
     }
 
+    /// The call audit, shared with the `/audit/calls` read route.
+    pub fn audit(&self) -> Arc<CallAudit> {
+        Arc::clone(&self.audit)
+    }
+
     /// Rate limits and response and time caps.
     pub fn limits(mut self, limiter: Limiter) -> Self {
         self.limiter = Arc::new(limiter);
@@ -688,6 +693,9 @@ impl ServerHandler for Gateway {
             subject: principal
                 .as_ref()
                 .map_or_else(String::new, |principal| principal.subject.clone()),
+            tenant: principal
+                .as_ref()
+                .and_then(|principal| principal.tenant.clone()),
             agent: principal
                 .as_ref()
                 .and_then(agent_id)

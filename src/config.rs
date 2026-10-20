@@ -117,16 +117,20 @@ pub struct ClusterConfig {
 
 /// Tool-call audit ([`crate::audit`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct AuditConfig {
     /// One JSON line per tool call, allowed or not.
     pub calls_file: PathBuf,
+    /// Token subjects allowed to read call events back by trace id, within
+    /// their own `tenant_id` (`GET /audit/calls`). Empty keeps reads off.
+    pub readers: Vec<String>,
 }
 
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             calls_file: "calls.jsonl".into(),
+            readers: Vec::new(),
         }
     }
 }

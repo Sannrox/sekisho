@@ -1,5 +1,6 @@
-//! HTTP host: `/healthz`, `/metrics`, OAuth protected-resource metadata, and
-//! the MCP endpoint at `/mcp` behind bearer authentication.
+//! HTTP host: `/healthz`, `/metrics`, OAuth protected-resource metadata, the
+//! MCP endpoint at `/mcp` behind bearer authentication, and `/audit/calls`
+//! for configured audit readers.
 
 use std::sync::Arc;
 
@@ -98,6 +99,12 @@ pub fn router(
         let metadata = metadata.clone();
         async move { axum::Json(metadata) }
     });
+    let audit_reads = Router::new()
+        .route("/audit/calls", get(audit_calls))
+        .with_state(Arc::new(AuditReads {
+            state: state.clone(),
+            audit: gateway.audit(),
+        }));
     let mcp_service = Router::new()
         .nest_service("/mcp", crate::gateway::service(mcp, gateway, shutdown))
         .layer(middleware::from_fn_with_state(auth, require_bearer));
@@ -110,6 +117,7 @@ pub fn router(
         )
         .route("/.well-known/oauth-protected-resource/mcp", metadata_route)
         .with_state(state)
+        .merge(audit_reads)
         .merge(mcp_service)
         // Outermost, so preflights (no token) and metadata fetches get it.
         .layer(cors(&mcp.allowed_origins))
@@ -193,6 +201,91 @@ async fn require_bearer(
             format!("{rejection}\n"),
         )
             .into_response(),
+    }
+}
+
+struct AuditReads {
+    state: Arc<AppState>,
+    audit: Arc<crate::audit::CallAudit>,
+}
+
+struct AuditQuery {
+    trace_id: String,
+    cursor: u64,
+    limit: usize,
+}
+
+impl AuditQuery {
+    /// `trace_id` is required; `cursor` defaults to 0 and `limit` to 100.
+    fn parse(query: Option<&str>) -> Option<Self> {
+        let (mut trace_id, mut cursor, mut limit) = (None, 0, 100);
+        for (name, value) in url::form_urlencoded::parse(query.unwrap_or("").as_bytes()) {
+            match name.as_ref() {
+                "trace_id" => trace_id = Some(value.into_owned()),
+                "cursor" => cursor = value.parse().ok()?,
+                "limit" => limit = value.parse().ok()?,
+                _ => {}
+            }
+        }
+        Some(Self {
+            trace_id: trace_id?,
+            cursor,
+            limit,
+        })
+    }
+}
+
+/// `GET /audit/calls?trace_id=&cursor=&limit=`: one trace's call events for
+/// the caller's tenant. Off (404) unless `[audit] readers` names subjects; a
+/// reader without a `tenant_id` claim is refused. An unknown trace and
+/// another tenant's trace read the same: an empty page.
+async fn audit_calls(
+    State(reads): State<Arc<AuditReads>>,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+) -> Response {
+    if !reads.audit.readable() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let principal = match reads.state.authenticate(&headers) {
+        Ok(principal) => principal,
+        Err(rejection) => {
+            return (StatusCode::UNAUTHORIZED, format!("{rejection}\n")).into_response();
+        }
+    };
+    let Some(tenant) = principal
+        .tenant
+        .filter(|_| reads.audit.may_read(&principal.subject))
+    else {
+        return (StatusCode::FORBIDDEN, "not an audit reader for a tenant\n").into_response();
+    };
+    let Some(query) = AuditQuery::parse(uri.query()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "trace_id is required; cursor and limit are numbers\n",
+        )
+            .into_response();
+    };
+    let valid = query.trace_id.len() == 32
+        && query
+            .trace_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid {
+        return (
+            StatusCode::BAD_REQUEST,
+            "trace_id must be 32 lowercase hex\n",
+        )
+            .into_response();
+    }
+    let audit = Arc::clone(&reads.audit);
+    let page = tokio::task::spawn_blocking(move || {
+        audit.read(&tenant, &query.trace_id, query.cursor, query.limit)
+    })
+    .await;
+    match page {
+        Ok(Ok(page)) => axum::Json(page).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "audit unavailable\n").into_response(),
     }
 }
 

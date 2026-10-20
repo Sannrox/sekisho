@@ -165,7 +165,8 @@ async fn serve(config: &Config) -> Result<()> {
         federation,
         config.policy.clone(),
         sekisho::exchange::Exchanger::new(config.exchange.clone()),
-        sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+        sekisho::audit::CallAudit::new(config.audit.calls_file.clone())
+            .readers(config.audit.readers.clone()),
         metrics,
     )
     .progressive(config.mcp.progressive)
