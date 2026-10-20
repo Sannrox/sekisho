@@ -253,7 +253,8 @@ impl Stack {
             federation,
             config.policy.clone(),
             sekisho::exchange::Exchanger::new(config.exchange.clone()),
-            sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+            sekisho::audit::CallAudit::new(config.audit.calls_file.clone())
+                .readers(config.audit.readers.clone()),
             Default::default(),
         )
         .guardrails(sekisho::guardrails::Guardrails::new(
@@ -300,7 +301,8 @@ impl Stack {
             federation,
             self.config.policy.clone(),
             sekisho::exchange::Exchanger::new(self.config.exchange.clone()),
-            sekisho::audit::CallAudit::new(self.config.audit.calls_file.clone()),
+            sekisho::audit::CallAudit::new(self.config.audit.calls_file.clone())
+                .readers(self.config.audit.readers.clone()),
             Default::default(),
         )
         .guardrails(sekisho::guardrails::Guardrails::new(
@@ -338,14 +340,8 @@ impl Stack {
         address: &str,
         extra: serde_json::Value,
     ) -> RunningService<RoleClient, ClientConfig> {
-        let bearer = token("k1", &key(1), claims(extra));
-        ClientConfig::default()
-            .serve(StreamableHttpClientTransport::from_config(
-                StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"))
-                    .auth_header(bearer),
-            ))
+        self.client_on_with(address, extra, std::collections::HashMap::new())
             .await
-            .unwrap()
     }
 
     /// Like [`Self::client`], sending `headers` on every request.
@@ -354,15 +350,22 @@ impl Stack {
         extra: serde_json::Value,
         headers: std::collections::HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
     ) -> RunningService<RoleClient, ClientConfig> {
+        self.client_on_with(&self.address, extra, headers).await
+    }
+
+    /// Like [`Self::client_on`], sending `headers` on every request.
+    pub async fn client_on_with(
+        &self,
+        address: &str,
+        extra: serde_json::Value,
+        headers: std::collections::HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) -> RunningService<RoleClient, ClientConfig> {
         let bearer = token("k1", &key(1), claims(extra));
         ClientConfig::default()
             .serve(StreamableHttpClientTransport::from_config(
-                StreamableHttpClientTransportConfig::with_uri(format!(
-                    "http://{}/mcp",
-                    self.address
-                ))
-                .auth_header(bearer)
-                .custom_headers(headers),
+                StreamableHttpClientTransportConfig::with_uri(format!("http://{address}/mcp"))
+                    .auth_header(bearer)
+                    .custom_headers(headers),
             ))
             .await
             .unwrap()

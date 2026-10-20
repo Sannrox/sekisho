@@ -73,7 +73,13 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   tokens, arguments or results. The trace id comes from the caller's W3C
   `traceparent`, or is generated, and the upstream call carries it in a new
   `traceparent` span so engine receipts link back. `/metrics` counts calls
-  by decision (`sekisho_tool_calls_total`).
+  by decision (`sekisho_tool_calls_total`). Replicas append to the shared
+  file under an exclusive flock. Subjects listed in `[audit] readers` read
+  one trace back with `GET /audit/calls?trace_id=<32 hex>&cursor=&limit=`
+  (oldest first, at most 500 events and 1 MiB scanned per page, without
+  blocking appends). They see only events for their own
+  `tenant_id` claim, and another tenant's trace reads as an empty page.
+  Reads are off (404) while `readers` is empty.
 
   ```sh
   sekisho --config sekisho.toml registry list

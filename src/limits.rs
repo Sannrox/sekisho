@@ -411,12 +411,12 @@ fn now_ms() -> u64 {
 }
 
 /// Exclusive `flock` on an open file. Process death releases it.
-struct FileLock {
-    file: File,
+pub(crate) struct FileLock {
+    pub(crate) file: File,
 }
 
 impl FileLock {
-    fn exclusive(file: File) -> std::io::Result<Self> {
+    pub(crate) fn exclusive(file: File) -> std::io::Result<Self> {
         // SAFETY: `file` is an open fd; LOCK_EX blocks until this process holds it.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
