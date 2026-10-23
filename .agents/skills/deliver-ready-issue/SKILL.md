@@ -184,7 +184,8 @@ mark the Issue unless documented maintainer policy requires it.
    Land one lane at a time; wait for a sibling lane's merge to finish and
    recheck `mergeable` before starting yours.
 3. Prefer squash merge for Verified linear history on `main`:
-   `gh pr merge --squash --delete-branch`.
+   `gh pr merge <pr> --auto --squash --delete-branch --match-head-commit <sha>`
+   (see the landing rules below).
    Use `--match-head-commit` with the published tip when available. Do not use
    GitHub rebase-merge when Verified commits matter. A failed or timed-out
    merge response may still have merged; reconcile the remote Pull Request
@@ -210,8 +211,25 @@ mark the Issue unless documented maintainer policy requires it.
 5. Invoke `advance-issue-frontier` in report-only mode unless the user also
    authorized frontier status updates.
 
-Never enable auto-merge, bypass checks, relax protection, or merge beyond the
-authority ceiling.
+Landing rules (pinned auto-merge, no reruns for green):
+
+- Land with GitHub auto-merge pinned to the reviewed head:
+  `gh pr merge <pr> --auto --squash --delete-branch --match-head-commit <sha>`.
+  GitHub merges once the required checks pass. A later push needs a new
+  request. Check the head, checks and mergeability every few minutes until
+  the merge is confirmed; a watcher timing out ends observation, not the task.
+- Never rerun CI to chase green. Classify each failed check against the
+  newest `main` run of the same job: fix a failure the change caused; a
+  failure that also fails on `main` is inherited, and a red `main` is an
+  emergency fixed in its own change first. Name inherited failures in the
+  Pull Request.
+- A failure that does not reproduce and is unrelated to the change is a flaky
+  test: open an Issue with the failing output before any rerun, and fix the
+  flake rather than rerunning it again.
+- Refresh onto `main` only for a conflict, a failing gate, or an explicit
+  request, never just because `main` moved.
+
+Never bypass checks, relax protection, or merge beyond the authority ceiling.
 
 ## Report completion
 
