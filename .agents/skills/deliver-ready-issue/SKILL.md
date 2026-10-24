@@ -118,11 +118,12 @@ mark the Issue unless documented maintainer policy requires it.
 1. Add focused deterministic tests while implementing.
 2. Run `verify-change` and retain exact commands, results, skips, and remaining
    uncertainty. At minimum for ship: `cargo fmt --check`, focused/`cargo test`,
-   and `cargo clippy --all-targets -- -D warnings` (offline; no plane required).
+   and `cargo clippy --all-targets -- -D warnings` (offline; no issuer or
+   upstream required).
 3. Run **`autoreview` before committing** (or before push if already committed).
    Do **not** vendor the skill into this repo. Resolve the shared helper (env
-   `AUTOREVIEW`, else agent-skills / `AGENTS_HOME` / sekai-chisei path—see
-   `AGENTS.md` “Agent delivery closeout”). Do not skip because CI is green:
+   `AUTOREVIEW`, else agent-skills / `AGENTS_HOME`—see `AGENTS.md` “Agent
+   delivery closeout”). Do not skip because CI is green:
 
    ```bash
    # After commit on a topic branch (preferred):
@@ -148,17 +149,12 @@ mark the Issue unless documented maintainer policy requires it.
    `git merge-base --is-ancestor origin/main HEAD`. If the check fails, refresh
    the branch onto `main` and rerun the affected checks. Otherwise refresh only
    for a failing gate, an explicit request, or a sibling lane that landed on a
-   shared surface (ports and settings, governance adapters, the workspace jail,
-   the sekai-client proto pin, or the kekkai pin). Do not rebase merely because `main` advanced.
-2. Publish to the claim branch with **GitHub-verified** commits via
-   `scripts/gh-verified-push.sh` (GraphQL `createCommitOnBranch`), not a plain
-   `git push`, unless the user explicitly asks for git-protocol push:
-   - Claim branch (already exists on GitHub):
-     `scripts/gh-verified-push.sh --branch <type>/<issue> --sync-local`
-   - A branch that does not exist yet (no claim was possible):
-     `scripts/gh-verified-push.sh --create-branch-from origin/main --branch <type>/<issue> --sync-local`
-   - Confirm the script reports `verification.verified=true` and that the
-     hosted tree matches local `HEAD`.
+   shared surface (config and the MCP endpoint, verifier and token exchange,
+   registry/policy/audit files, the cluster rate-limit store, or guardrails).
+   Do not rebase merely because `main` advanced.
+2. Publish the claim branch with `git push -u origin HEAD` (or `git push` if
+   upstream is already set) unless the user asked for a different publish path.
+   This repository has no `scripts/gh-verified-push.sh`.
 3. Open the Pull Request as a draft with the first published commit, then mark
    it ready once verification and review are complete and `mergeable` is no
    longer `UNKNOWN` (`gh pr ready <pr>`). The Pull Request:
@@ -178,8 +174,8 @@ mark the Issue unless documented maintainer policy requires it.
 ### 6. Land when authorized
 
 1. Wait for required CI and review. Resolve actionable feedback in the same
-   branch and rerun affected checks. Re-publish review fixes with
-   `scripts/gh-verified-push.sh` so the PR tip stays Verified.
+   branch and rerun affected checks. Re-publish review fixes with `git push`
+   unless the user asked for a different publish path.
 2. Recheck that dependencies and repository protections still permit landing.
    Land one lane at a time; wait for a sibling lane's merge to finish and
    recheck `mergeable` before starting yours.

@@ -437,7 +437,7 @@ impl Drop for FileLock {
 
 /// Truncate `result` to `cap` bytes of text and say so in an extra block.
 /// Returns the result and whether it was truncated.
-pub fn cap_response(result: CallToolResult, cap: usize) -> (CallToolResult, bool) {
+pub(crate) fn cap_response(result: CallToolResult, cap: usize) -> (CallToolResult, bool) {
     let size = serde_json::to_vec(&result).map_or(0, |bytes| bytes.len());
     if size <= cap {
         return (result, false);

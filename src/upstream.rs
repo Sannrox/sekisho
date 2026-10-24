@@ -29,11 +29,11 @@ fn error(upstream: &UpstreamConfig, message: impl std::fmt::Display) -> Upstream
     }
 }
 
-pub fn timed_out_call(upstream: &UpstreamConfig) -> UpstreamError {
+pub(crate) fn timed_out_call(upstream: &UpstreamConfig) -> UpstreamError {
     error(upstream, "tool call exceeded the execution time limit")
 }
 
-pub fn timed_out(upstream: &UpstreamConfig) -> UpstreamError {
+pub(crate) fn timed_out(upstream: &UpstreamConfig) -> UpstreamError {
     error(upstream, "tool listing timed out")
 }
 

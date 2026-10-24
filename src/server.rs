@@ -58,7 +58,7 @@ pub struct ProtectedResource {
 
 /// Where RFC 9728 puts the metadata for `resource`: the well-known prefix
 /// inserted between the origin and the resource path.
-pub fn metadata_url(resource: &str) -> String {
+fn metadata_url(resource: &str) -> String {
     let after_scheme = resource.find("://").map_or(0, |at| at + 3);
     let path_start = resource[after_scheme..]
         .find('/')

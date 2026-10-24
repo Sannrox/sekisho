@@ -1,1 +1,4 @@
 /target
+
+# Delivery lane worktrees (AGENTS.md, "Parallel delivery lanes")
+/.worktrees/
