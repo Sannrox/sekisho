@@ -223,7 +223,7 @@ impl Verifier {
 
 /// Equal-length inputs compare in constant time. Unequal lengths fail
 /// without comparing contents, so timing reveals at most the length.
-pub fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
+fn constant_time_eq(expected: &[u8], presented: &[u8]) -> bool {
     expected.len() == presented.len() && bool::from(expected.ct_eq(presented))
 }
 

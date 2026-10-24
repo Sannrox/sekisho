@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub mod stack;
 
@@ -88,13 +88,9 @@ impl Fixture {
         self.write(
             "sekisho.toml",
             &format!(
-                "listen = \"{listen}\"\n\n[verifier]\nkind = \"jwks\"\nissuer = \"{ISSUER}\"\naudience = \"{AUDIENCE}\"\njwks_file = \"jwks.json\"\n\n[mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://issuer.example.test\"]\n"
+                "listen = \"{listen}\"\n\n[verifier]\nkind = \"jwks\"\nissuer = \"{ISSUER}\"\naudience = \"{AUDIENCE}\"\njwks_file = \"jwks.json\"{MCP_SECTION}"
             ),
         )
-    }
-
-    pub fn path(&self) -> &Path {
-        self.dir.path()
     }
 }
 

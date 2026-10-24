@@ -349,7 +349,7 @@ fn find(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 
 /// Marking labels an engine response carries, under a `markings` or
 /// `marking_labels` key anywhere in its JSON.
-pub fn marking_labels(result_json: &serde_json::Value) -> Vec<String> {
+fn marking_labels(result_json: &serde_json::Value) -> Vec<String> {
     let mut labels = Vec::new();
     fn walk(value: &serde_json::Value, labels: &mut Vec<String>) {
         match value {

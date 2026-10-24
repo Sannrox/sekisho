@@ -17,13 +17,10 @@ Run the narrowest useful checks first, then expand according to change risk.
 
    | Surface | Required evidence |
    | --- | --- |
-   | Rust source | focused tests plus the repository verifier’s source gate |
-   | public or multi-component behavior | affected integration test plus normal suite |
-   | gateway | deterministic `scripts/chisei_gateway_smoke.sh` |
-   | protocol | generated build, service/client/example coverage, compatibility review |
-   | persistence | fresh and upgrade behavior; SQLite/PostgreSQL alignment where implemented |
-   | configuration | parsing/default tests, `.env.example`, configuration docs |
-   | docs/templates/Skills | syntax, links or commands where practical; Skill validator for Skills |
+   | Rust source | focused tests plus `cargo clippy --all-targets --locked -- -D warnings` |
+   | MCP / gateway | affected integration test under `tests/` plus the normal suite |
+   | configuration | parsing/default tests, `sekisho.example.toml`, README |
+   | docs/templates/Skills | syntax, links or commands where practical |
 
 3. Before ship-level handoff, use the repository Make targets for the normal
    gates unless the user explicitly requested a narrower check:
@@ -35,13 +32,9 @@ Run the narrowest useful checks first, then expand according to change risk.
    make test-integration
    ```
 
-   Run `make test-e2e` for changes affecting the host proof or public embedding
-   path. The Makefile is the source of truth for the command; do not ask an
-   agent to reproduce it from prose.
-
-   Run `cargo build --locked` when packaging, feature selection, or binaries
-   changed independently of tests. Complete when every applicable local gate
-   has a result.
+   The Makefile is the source of truth for the command; do not ask an agent to
+   reproduce it from prose. `make all` is `cargo build --all-targets --locked`.
+   Complete when every applicable local gate has a result.
 4. Keep service-dependent tests ignored unless prerequisites and credentials
    are intentionally available. Never print secrets or persist live provider
    payloads. Complete when skipped checks name both the reason and residual

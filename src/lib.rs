@@ -2,9 +2,9 @@
 //!
 //! This crate is the standalone host: configuration, the bearer-token
 //! verifier, the MCP endpoint, health and metrics endpoints, and the
-//! diagnostics bundle. It
-//! makes no network calls of its own; the JWKS comes from a local file, so it
-//! starts and verifies tokens offline.
+//! diagnostics bundle. The JWKS is a local file, so it starts and verifies
+//! tokens without reaching the issuer. Upstream MCP calls and per-call token
+//! exchange are separate, and only happen when those are configured.
 
 pub mod audit;
 pub mod config;

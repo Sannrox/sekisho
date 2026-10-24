@@ -30,9 +30,9 @@ stalled lane. It is not an orchestration-only role.
    implementation Pull Requests plus claim branches without one. Do not count
    assigned or planned work as a running lane, and do not start a lane for an
    Issue whose check says `claimed`.
-3. Reject candidate pairs that touch the same collision surface: ports and
-   settings, governance adapters, the workspace jail, or the sekai-client proto
-   pin. Run such Issues in sequence.
+3. Reject candidate pairs that touch the same collision surface: config and
+   the MCP endpoint, verifier and token exchange, registry/policy/audit files,
+   the cluster rate-limit store, or guardrails. Run such Issues in sequence.
 4. Resolve one authority ceiling for the run. Claiming needs Publish or Land,
    or an explicit claim authorization; without it the lanes are invisible to
    other machines and must be reported as such. Land authority still lands one
@@ -83,12 +83,12 @@ Lane brief
 - reserved by sibling lanes, do not touch: <surfaces or paths, or none>
 - procedure: run deliver-ready-issue from "3. Bound the implementation"
   onward inside the worktree; readiness, claim, and isolation are done.
-- publish only to the claim branch, with
-  scripts/gh-verified-push.sh --branch <type>/<issue> --sync-local; open the
-  Pull Request as a draft with "Closes #<issue>" and public lane fields
-  (branch, repo-relative worktree, base SHA, published SHA, authority). Do
-  not paste this internal brief, hostnames, or absolute paths onto GitHub.
-  Mark the PR ready when verified.
+- publish only to the claim branch, with `git push -u origin HEAD` (or
+  `git push` if upstream is already set); open the Pull Request as a draft
+  with "Closes #<issue>" and public lane fields (branch, repo-relative
+  worktree, base SHA, published SHA, authority). Do not paste this internal
+  brief, hostnames, or absolute paths onto GitHub. Mark the PR ready when
+  verified.
 - on a shared machine, fetch --prune, worktree add/remove, branch delete, and
   merge are lead-only; commit and publish only your own branch from your own
   worktree. Never enter the primary checkout or another lane's worktree.
@@ -117,7 +117,7 @@ Lane brief
 ## 4. Publish and land in sequence
 
 1. Each lane publishes to its claim branch from its own worktree with
-   `scripts/gh-verified-push.sh --branch <type>/<issue> --sync-local` under
+   `git push -u origin HEAD` (or `git push` if upstream is already set) under
    Publish authority, after `git fetch --prune origin` and
    `git merge-base --is-ancestor origin/main HEAD` pass. Publishing may happen
    concurrently; landing never.
