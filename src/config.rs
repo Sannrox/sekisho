@@ -48,6 +48,9 @@ pub struct Config {
     /// Shared replica state. Empty keeps rate limits in-process.
     #[serde(default)]
     pub cluster: ClusterConfig,
+    /// Which state backend holds replica state (#26).
+    #[serde(default)]
+    pub state: StateConfig,
     /// Per-call token exchange. Without it, tool calls are refused.
     #[serde(default)]
     pub exchange: Option<ExchangeConfig>,
@@ -120,6 +123,24 @@ pub struct ClusterConfig {
     /// point at the same paths.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
+}
+
+/// The state backend ([`crate::state`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateConfig {
+    /// Files: `[cluster] state_dir`, `[registry]`, `[policy]`, `[audit]` and
+    /// `[mitigations]` paths.
+    #[default]
+    Directory,
+    /// PostgreSQL for rate limits and call audit; registry, policy and
+    /// mitigations stay on the directory backend until #47. Needs a build
+    /// with the `postgres` feature.
+    Postgres {
+        /// File holding the connection URL (`postgres://…?sslmode=require`),
+        /// so credentials stay out of the config.
+        url_file: PathBuf,
+    },
 }
 
 /// Tool-call audit ([`crate::audit`]).
@@ -226,6 +247,9 @@ impl Config {
         config.registry.audit_file = base.join(&config.registry.audit_file);
         config.policy.file = base.join(&config.policy.file);
         config.audit.calls_file = base.join(&config.audit.calls_file);
+        if let StateConfig::Postgres { url_file } = &mut config.state {
+            *url_file = base.join(&*url_file);
+        }
         if let Some(state_dir) = &mut config.cluster.state_dir {
             *state_dir = base.join(&*state_dir);
         }
@@ -247,6 +271,11 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         self.limits.validate().map_err(ConfigError::Invalid)?;
         self.approvals.validate().map_err(ConfigError::Invalid)?;
+        if cfg!(not(feature = "postgres")) && matches!(self.state, StateConfig::Postgres { .. }) {
+            return Err(ConfigError::Invalid(
+                "[state] backend = \"postgres\" needs a build with the postgres feature".into(),
+            ));
+        }
         if self.mcp.resource.trim().is_empty() || self.mcp.authorization_servers.is_empty() {
             return Err(ConfigError::Invalid(
                 "mcp needs a resource URL and at least one authorization server".into(),
@@ -290,6 +319,36 @@ impl Config {
                 ))
             }
             _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_postgres_backend_needs_the_feature_and_resolves_its_url_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekisho.toml");
+        std::fs::write(
+            &path,
+            "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"t\"\n\
+             [mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://i\"]\n\
+             [state]\nbackend = \"postgres\"\nurl_file = \"pg-url\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&path);
+        if cfg!(feature = "postgres") {
+            assert_eq!(
+                loaded.unwrap().state,
+                StateConfig::Postgres {
+                    url_file: dir.path().join("pg-url")
+                }
+            );
+        } else {
+            let error = loaded.unwrap_err().to_string();
+            assert!(error.contains("postgres feature"), "{error}");
         }
     }
 }

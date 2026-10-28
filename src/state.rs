@@ -1,11 +1,16 @@
 //! Where replica state lives (#26): rate-limit buckets, the tool registry,
 //! agent policy, the call audit and mitigations.
 //!
-//! [`StateBackend`] is the seam. [`Directory`] is the default backend and the
-//! only one so far: the files every earlier release used, in the same
-//! formats, so replicas of both versions can share them during a rolling
-//! deploy. Its consistency rests on exclusive file locks, so replicas must
-//! share one host or a filesystem whose locks every replica sees.
+//! [`StateBackend`] is the seam. [`Directory`] is the default backend: the
+//! files every earlier release used, in the same formats, so replicas of both
+//! versions can share them during a rolling deploy. Its consistency rests on
+//! exclusive file locks, so replicas must share one host or a filesystem
+//! whose locks every replica sees.
+//!
+//! With the `postgres` feature, `[state] backend = "postgres"` keeps rate
+//! limits and the call audit in PostgreSQL (`state::postgres`), so replicas on
+//! separate hosts share them. Registry, policy and mitigations stay on the
+//! directory backend until #47.
 //!
 //! Every method blocks on storage; async callers run them on the blocking
 //! pool. A store error is an error, never an empty answer, so callers fail
@@ -18,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::audit::{CallEvent, CallLog, CallPage};
-use crate::config::Config;
+use crate::config::{Config, StateConfig};
 use crate::limits::Rate;
 use crate::mitigations::{Commit, MitigationError, MitigationFiles, State};
 use crate::policy::{PolicyError, PolicyFile};
@@ -57,6 +62,64 @@ pub enum StoreError {
     },
     #[error("{store} store is not configured")]
     NotConfigured { store: Store },
+    #[error("{store} store did not answer in time")]
+    Timeout { store: Store },
+    #[cfg(feature = "postgres")]
+    #[error("{store} store: {}", self::postgres::detail(source))]
+    Postgres {
+        store: Store,
+        #[source]
+        source: ::postgres::Error,
+    },
+}
+
+/// How long a caller waits before retrying a call a store failure refused.
+pub const STORE_RETRY: Duration = Duration::from_secs(1);
+
+/// The longest a call waits on the state backend before forwarding (rate
+/// limit, `started` audit event, and the outcome of a call refused before
+/// forwarding), and again for the outcome of a forwarded call; the longest
+/// a readiness probe waits. Past it the call fails closed with
+/// [`STORE_RETRY`] and readiness is false, whatever the backend is stuck
+/// on; the blocking work may still finish later.
+pub const STORE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Run blocking store work off the async workers, waiting at most the
+/// remaining `budget` and taking the time spent from it, so several steps
+/// of one call share one budget. A panic or an exhausted budget is a
+/// [`StoreError::Timeout`] of `store`.
+pub async fn blocking<T: Send + 'static>(
+    store: Store,
+    budget: &mut Duration,
+    work: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, StoreError> {
+    let started = Instant::now();
+    let result = tokio::time::timeout(*budget, tokio::task::spawn_blocking(work)).await;
+    *budget = budget.saturating_sub(started.elapsed());
+    match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => Err(StoreError::Timeout { store }),
+    }
+}
+
+/// Why [`open`] could not build the configured backend.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error("reading the postgres URL file {path}: {source}")]
+    UrlFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[cfg(feature = "postgres")]
+    #[error("postgres URL: {0}")]
+    Url(#[source] ::postgres::Error),
+    #[cfg(feature = "postgres")]
+    #[error("postgres TLS: {0}")]
+    Tls(#[source] rustls::Error),
+    #[cfg(not(feature = "postgres"))]
+    #[error("[state] backend = \"postgres\" needs a build with the postgres feature")]
+    NotBuilt,
 }
 
 /// One rate-limit bucket a call is charged to: its key and refill rate.
@@ -143,7 +206,7 @@ pub type Probe = Vec<(Store, Result<(), String>)>;
 /// Shared replica state. Implementations keep every write durable before
 /// they return, and serialize read-modify-writes across replicas.
 pub trait StateBackend: Send + Sync {
-    /// Short name for health output (`directory`).
+    /// Short name for health output (`directory` or `postgres`).
     fn kind(&self) -> &'static str;
 
     /// Charge `cost` to every bucket at wall time `now_ms`, or nothing and
@@ -195,9 +258,43 @@ pub trait StateBackend: Send + Sync {
     fn probe(&self) -> Probe;
 }
 
-/// The backend `config` selects.
-pub fn open(config: &Config) -> Arc<dyn StateBackend> {
-    Arc::new(Directory::new(config))
+/// The backend `config` selects. Opening connects nothing; the PostgreSQL
+/// backend connects, and migrates its schema, on first use.
+pub fn open(config: &Config) -> Result<Arc<dyn StateBackend>, OpenError> {
+    match &config.state {
+        StateConfig::Directory => Ok(Arc::new(Directory::new(config))),
+        #[cfg(feature = "postgres")]
+        StateConfig::Postgres { url_file } => {
+            Ok(Arc::new(self::postgres::Postgres::open(config, url_file)?))
+        }
+        #[cfg(not(feature = "postgres"))]
+        StateConfig::Postgres { .. } => Err(OpenError::NotBuilt),
+    }
+}
+
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+/// The last probe, reused for [`PROBE_TTL`].
+#[derive(Default)]
+pub(crate) struct ProbeCache(Mutex<Option<(Instant, Probe)>>);
+
+impl ProbeCache {
+    /// The cached probe while fresh, else `probe` run and cached.
+    pub(crate) fn get(&self, probe: impl FnOnce() -> Probe) -> Probe {
+        let mut probed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, probe)) = probed.as_ref()
+            && at.elapsed() < PROBE_TTL
+        {
+            return probe.clone();
+        }
+        let probe = probe();
+        *probed = Some((Instant::now(), probe.clone()));
+        probe
+    }
 }
 
 /// Files on a local or shared filesystem; see the module docs.
@@ -209,13 +306,12 @@ pub struct Directory {
     pub(crate) policy_file: PathBuf,
     pub(crate) calls: CallLog,
     pub(crate) mitigations: MitigationFiles,
-    /// Last probe, reused for [`PROBE_TTL`].
-    probed: Mutex<Option<(Instant, Probe)>>,
+    probed: ProbeCache,
 }
 
-/// How long a directory probe result is reused, so frequent `/readyz`
-/// polls do not each write scratch files. A store that breaks shows as
-/// unavailable within this long.
+/// How long a probe result is reused, so frequent `/readyz` polls do not
+/// each write scratch files or open transactions. A store that breaks shows
+/// as unavailable within this long.
 pub const PROBE_TTL: Duration = Duration::from_secs(1);
 
 /// Whether the write path next to `file` works: in its directory (or,
@@ -276,7 +372,7 @@ impl Directory {
             policy_file: config.policy.file.clone(),
             calls: CallLog::new(config.audit.calls_file.clone()),
             mitigations: MitigationFiles::new(&config.mitigations),
-            probed: Mutex::default(),
+            probed: ProbeCache::default(),
         }
     }
 
@@ -293,7 +389,7 @@ impl Directory {
                 file: Some(dir.join("mitigations.json")),
                 audit_file: Some(dir.join("mitigations-audit.jsonl")),
             }),
-            probed: Mutex::default(),
+            probed: ProbeCache::default(),
         }
     }
 }
@@ -379,25 +475,33 @@ impl StateBackend for Directory {
     /// and its audit log opened with the writer's options. Results are
     /// reused for [`PROBE_TTL`].
     fn probe(&self) -> Probe {
-        let mut probed = self
-            .probed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, probe)) = probed.as_ref()
-            && at.elapsed() < PROBE_TTL
-        {
-            return probe.clone();
-        }
-        let probe = self.probe_now();
-        *probed = Some((Instant::now(), probe.clone()));
-        probe
+        self.probed.get(|| self.probe_now())
     }
 }
 
 impl Directory {
     fn probe_now(&self) -> Probe {
         let reason = |error: &dyn std::fmt::Display| error.to_string();
-        let mut stores = vec![
+        let mut stores = self.probe_files();
+        stores.push((
+            Store::Audit,
+            crate::state::probe_append(self.calls.file(), true, Parent::MustExist)
+                .map_err(|e| reason(&e)),
+        ));
+        if let Some(path) = &self.limits_file {
+            stores.push((
+                Store::Limits,
+                crate::limits::probe_file(path).map_err(|e| reason(&e)),
+            ));
+        }
+        stores
+    }
+
+    /// Policy, registry and mitigations: the stores every backend keeps in
+    /// files so far.
+    pub(crate) fn probe_files(&self) -> Probe {
+        let reason = |error: &dyn std::fmt::Display| error.to_string();
+        vec![
             (
                 Store::Policy,
                 self.policy().map(drop).map_err(|e| reason(&e)),
@@ -411,19 +515,7 @@ impl Directory {
                 Store::Mitigations,
                 self.mitigations.probe().map_err(|e| reason(&e)),
             ),
-            (
-                Store::Audit,
-                crate::state::probe_append(self.calls.file(), true, Parent::MustExist)
-                    .map_err(|e| reason(&e)),
-            ),
-        ];
-        if let Some(path) = &self.limits_file {
-            stores.push((
-                Store::Limits,
-                crate::limits::probe_file(path).map_err(|e| reason(&e)),
-            ));
-        }
-        stores
+        ]
     }
 }
 
@@ -575,6 +667,22 @@ mod tests {
         ] {
             assert_eq!(std::fs::read(logs.join(log)).unwrap(), b"{}\n");
         }
+    }
+
+    #[tokio::test]
+    async fn steps_of_one_call_share_one_store_budget() {
+        let stalled = || -> Result<(), StoreError> {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        };
+        let mut budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let first = blocking(Store::Limits, &mut budget, stalled).await;
+        let second = blocking(Store::Audit, &mut budget, stalled).await;
+        assert!(matches!(first, Err(StoreError::Timeout { .. })));
+        assert!(matches!(second, Err(StoreError::Timeout { .. })));
+        assert!(budget.is_zero());
+        assert!(started.elapsed() < Duration::from_millis(400), "one budget");
     }
 
     #[test]

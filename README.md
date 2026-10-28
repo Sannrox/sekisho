@@ -67,13 +67,17 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   state_dir`, replicas share the buckets in `limits.json` under an exclusive
   flock; a store error fails closed with a 1s retry. MCP sessions are
   already stateless (2026-07-28); registry, policy and audit stay files.
-  Audit lines are fsynced before the response.
+  Audit lines are fsynced before the response; see Call audit for what
+  happens when one cannot be written.
 - **State backend.** Rate-limit buckets, registry, policy, call audit and
   mitigations go through one state backend. The directory backend, the
-  default and so far the only one, is the files described here, in the
-  same formats as earlier releases, so mixed versions can share them during
-  a rolling deploy. Its replicas need one host or a filesystem whose
-  exclusive locks they all see. `GET /readyz` answers 200 when every store
+  default, is the files described here, in the same formats as earlier
+  releases, so mixed versions can share them during a rolling deploy. Its
+  replicas need one host or a filesystem whose exclusive locks they all
+  see. With a build that has the `postgres` cargo feature
+  (`cargo build --release --features postgres`), `[state] backend =
+  "postgres"` keeps rate limits and the call audit in PostgreSQL, for
+  replicas on separate hosts; see PostgreSQL below. `GET /readyz` answers 200 when every store
   can do work and 503 otherwise, with `{"backend", "ready", "stores"}`
   naming each store `ok` or `unavailable`; the reason goes to the log. A
   store is ready when its data parses and its write path works: a scratch
@@ -87,6 +91,54 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   is missing makes its store unavailable. Results
   are reused for 1 s.
   `/healthz` stays a liveness check.
+- **PostgreSQL.** `[state] backend = "postgres"` with `url_file`, a file
+  holding the connection URL
+  (`postgres://user:password@host:5432/sekisho?sslmode=require`), so the
+  password stays out of the config. It covers rate limits and the call
+  audit only; registry, policy and mitigations stay in their files until
+  #47, so in this interim configuration replicas still share those files.
+  Rate limits are always shared with this backend, `[cluster] state_dir`
+  or not.
+  - *Schema.* Sekisho creates its tables (`sekisho_rate_buckets`,
+    `sekisho_call_audit`, `sekisho_schema_migrations`) on its first
+    connection, in one transaction under an advisory lock, so replicas
+    starting together are safe; a replica waits at most 3 s for another's
+    migration (30 s per statement), then retries on its next use.
+    Migrations are versioned and additive; an older release ignores newer
+    versions. The user needs `CREATE` on the
+    schema the first time, then read and write on these tables.
+  - *Rate limits.* A charge is one transaction that locks the call's
+    bucket rows, so replicas never lose an update. Each replica uses its
+    own clock: over any window a bucket admits at most `rate_per_sec ×`
+    the clock skew between replicas more than one clock would (none with
+    synchronized clocks). Buckets that are full again are deleted after a
+    charge, at most 500 at a time and once a minute per replica.
+  - *Call audit.* Each event is committed before the call answers, with
+    `synchronous_commit` raised to `on` when the server default is `off`.
+  - *Outages.* While the database cannot be reached, calls fail closed
+    with `retry after 1000 ms` and `/readyz` reports `limits` and `audit`
+    unavailable; connections come back on their own when it returns, with
+    no restart. Readiness runs each store's write in a transaction it rolls
+    back, on the same connections calls use. Waits are bounded: a free
+    connection 1 s, connecting 2 s (unless the URL sets
+    `connect_timeout`), a statement 2 s, a lock 1 s (such as a bucket row
+    another replica holds), with TCP keepalives on. A call waits on the
+    store at most 5 s in all before forwarding (rate limit and `started`
+    event; for a call refused before forwarding, its audit event too), and
+    at most 5 s more for a forwarded call's outcome event, then fails
+    closed; a readiness probe waits at most 5 s, then reports not ready.
+  - *Audit reads.* Events of one trace are numbered under a per-trace lock
+    and commit in order, so `/audit/calls` paging never skips an event.
+  - *TLS.* `sslmode` in the URL (`disable`, `prefer`, `require`) decides
+    whether TLS is used; when it is, the server certificate and host name
+    are always verified against the system roots (`SSL_CERT_FILE` adds
+    one).
+  - *Switching.* Moving from the directory backend is a deliberate
+    switch, not a rolling change: replicas on different backends do not
+    share buckets or audit, so stop or drain the directory replicas
+    before the PostgreSQL ones take traffic. Existing `limits.json` and
+    `calls.jsonl` are not imported; buckets start full and old audit
+    events stay in the file.
 - **Approval gate.** Tools listed in `[approvals] marked` (destructive or
   open-world, by registry key) are forwarded only along an approval route. A
   marked tool also listed in `engine` goes to an upstream that parks and
@@ -142,10 +194,17 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   ```
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
-  `failed`, `throttled`), reason, guardrail and approval summaries, the
+  `failed`, `throttled`), call id, reason, guardrail and approval summaries, the
   refusing mitigation's decision, latency,
   response size and trace id. Events never carry
-  tokens, arguments or results. The trace id comes from the caller's W3C
+  tokens, arguments or results. A call forwarded upstream also has a
+  `started` event with the same call id, written before the upstream
+  call: if it cannot be written the call is refused with `retry after
+  1000 ms` and nothing runs. If the outcome cannot be written after the
+  upstream ran, the call fails without a retry hint, with `call_id` and
+  `forwarded: true` in the error data, and no result; check that call
+  before retrying, since repeating it may repeat its effect. Releases
+  before `started` events skip them on read. The trace id comes from the caller's W3C
   `traceparent`, or is generated, and the upstream call carries it in a new
   `traceparent` span so engine receipts link back. `/metrics` counts calls
   by decision (`sekisho_tool_calls_total`). Replicas append to the shared

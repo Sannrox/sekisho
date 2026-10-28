@@ -8,8 +8,9 @@
 //! carries a `tenant_id`. Defaults are generous so interactive use is not
 //! throttled.
 //!
-//! Buckets live in this process, or with `[cluster] state_dir` in the state
-//! backend ([`crate::state`]) so replicas share them.
+//! Buckets live in this process, or with `[cluster] state_dir` or the
+//! PostgreSQL backend in the state backend ([`crate::state`]) so replicas
+//! share them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -186,11 +187,15 @@ impl Limiter {
         }
     }
 
-    /// Shared buckets in `store` with `[cluster] state_dir`, else in-process.
+    /// Shared buckets in `store` with `[cluster] state_dir` or a PostgreSQL
+    /// backend, else in-process.
     pub fn from_config(config: &crate::config::Config, store: &Arc<dyn StateBackend>) -> Self {
-        match config.cluster.state_dir {
-            Some(_) => Self::shared(config.limits.clone(), Arc::clone(store)),
-            None => Self::new(config.limits.clone()),
+        let shared = config.cluster.state_dir.is_some()
+            || matches!(config.state, crate::config::StateConfig::Postgres { .. });
+        if shared {
+            Self::shared(config.limits.clone(), Arc::clone(store))
+        } else {
+            Self::new(config.limits.clone())
         }
     }
 
@@ -252,11 +257,13 @@ impl Limiter {
         for (scope, key, rate) in &scopes {
             if let Some(bucket) = buckets.table.get_mut(&(*scope, (*key).to_string())) {
                 bucket.tokens -= cost;
+                // Full counts from the time the tokens are valid at.
+                let from = bucket.at.max(now);
                 let refill = (rate.burst - bucket.tokens) / rate.rate_per_sec;
                 bucket.full_at = Duration::try_from_secs_f64(refill)
                     .ok()
-                    .and_then(|refill| now.checked_add(refill))
-                    .unwrap_or(now + IDLE * 1_000);
+                    .and_then(|refill| from.checked_add(refill))
+                    .unwrap_or(from + IDLE * 1_000);
             }
         }
         Ok(())
@@ -278,8 +285,8 @@ impl Limiter {
     }
 
     /// Shared buckets. `Instant` is ignored; wall time is [`SystemTime`].
-    /// A store failure fails closed with a 1s retry so a poisoned store
-    /// cannot open the limiter.
+    /// A store failure fails closed with a [`crate::state::STORE_RETRY`]
+    /// retry so a poisoned or unreachable store cannot open the limiter.
     fn admit_shared(
         &self,
         store: &dyn StateBackend,
@@ -299,7 +306,7 @@ impl Limiter {
             .take(&buckets, self.cost(tool), now_ms())
             .unwrap_or_else(|error| {
                 eprintln!("shared rate-limit store failed: {error}");
-                Err(Duration::from_secs(1))
+                Err(crate::state::STORE_RETRY)
             })
     }
 }
@@ -369,7 +376,9 @@ fn read_store(path: &Path) -> std::io::Result<FileStore> {
 }
 
 /// The bucket arithmetic of the shared store, on wall-clock milliseconds.
-fn charge(
+/// Every backend charges with it, so the result does not depend on where
+/// buckets live.
+pub(crate) fn charge(
     store: &mut FileStore,
     buckets: &[SharedBucket<'_>],
     cost: f64,
@@ -408,27 +417,33 @@ fn charge(
     for SharedBucket { key, rate } in buckets {
         if let Some(bucket) = store.buckets.get_mut(*key) {
             bucket.tokens -= cost;
+            // Tokens are valid at `at_ms`, which a charge from a replica
+            // with an earlier clock does not move back; full counts from
+            // there, rounded up, so a sweep never forgives a debt.
             let refill = (rate.burst - bucket.tokens) / rate.rate_per_sec;
             bucket.full_at_ms = Duration::try_from_secs_f64(refill)
                 .ok()
-                .and_then(|refill| now_ms.checked_add(refill.as_millis() as u64))
-                .unwrap_or(now_ms.saturating_add(IDLE.as_millis() as u64 * 1_000));
+                .and_then(|refill| {
+                    let refill_ms = u64::try_from(refill.as_micros().div_ceil(1_000)).ok()?;
+                    bucket.at_ms.checked_add(refill_ms)
+                })
+                .unwrap_or(bucket.at_ms.saturating_add(IDLE.as_millis() as u64 * 1_000));
         }
     }
     Ok(())
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct FileStore {
+pub(crate) struct FileStore {
     #[serde(default)]
-    buckets: BTreeMap<String, FileBucket>,
+    pub(crate) buckets: BTreeMap<String, FileBucket>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct FileBucket {
-    tokens: f64,
-    at_ms: u64,
-    full_at_ms: u64,
+pub(crate) struct FileBucket {
+    pub(crate) tokens: f64,
+    pub(crate) at_ms: u64,
+    pub(crate) full_at_ms: u64,
 }
 
 fn file_key(scope: Scope, id: &str) -> String {
@@ -624,6 +639,26 @@ mod tests {
         assert!(marker.contains("truncated from"), "{marker}");
         let small = CallToolResult::success(vec![ContentBlock::text("ok")]);
         assert!(!cap_response(small, 1_000).1);
+    }
+
+    #[test]
+    fn a_charge_at_an_earlier_clock_counts_full_from_the_buckets_own_time() {
+        let rate = Rate {
+            rate_per_sec: 1.0,
+            burst: 2.0,
+        };
+        let buckets = [SharedBucket {
+            key: "agent:a",
+            rate,
+        }];
+        let mut store = FileStore::default();
+        charge(&mut store, &buckets, 1.0, 10_000).unwrap();
+        assert_eq!(store.buckets["agent:a"].full_at_ms, 11_000);
+        // A replica 5 s behind charges the same bucket: still 1 token at
+        // 10 s, now 0, so full at 12 s, not 5 s + 2 s.
+        charge(&mut store, &buckets, 1.0, 5_000).unwrap();
+        let bucket = &store.buckets["agent:a"];
+        assert_eq!((bucket.at_ms, bucket.full_at_ms), (10_000, 12_000));
     }
 
     #[test]

@@ -300,13 +300,17 @@ impl Gateway {
 
     /// Policy, registry, exchange and upstream call for one tool call.
     /// Returns the response, its encoded size, the guardrail summary and the
-    /// approval gate's audit label.
+    /// approval gate's audit label. Right before the upstream call,
+    /// `call.event` is recorded as the call's `started` event and
+    /// `call.forwarded` set; a call whose `started` event cannot be
+    /// recorded is refused and never reaches the upstream. Storage waits
+    /// take from `call.budget`.
     async fn forward(
         &self,
         mut request: CallToolRequestParams,
         context: &RequestContext<RoleServer>,
         principal: Option<&Principal>,
-        trace_id: &str,
+        call: &mut CallState,
         invalid_invoke: Option<&str>,
     ) -> Result<
         (
@@ -343,19 +347,23 @@ impl Gateway {
             let user = principal.subject.clone();
             let tenant = principal.tenant.clone();
             let tool = tool.clone();
-            tokio::task::spawn_blocking(move || {
-                limiter.admit(
-                    &Caller {
-                        agent: &agent_id,
-                        user: &user,
-                        tenant: tenant.as_deref(),
-                    },
-                    &tool,
-                    Instant::now(),
-                )
+            let charged =
+                crate::state::blocking(crate::state::Store::Limits, &mut call.budget, move || {
+                    Ok(limiter.admit(
+                        &Caller {
+                            agent: &agent_id,
+                            user: &user,
+                            tenant: tenant.as_deref(),
+                        },
+                        &tool,
+                        Instant::now(),
+                    ))
+                })
+                .await;
+            charged.unwrap_or_else(|error| {
+                eprintln!("{error}");
+                Err(crate::state::STORE_RETRY)
             })
-            .await
-            .unwrap_or_else(|_| Err(Duration::from_secs(1)))
         } else {
             self.limiter.admit(&caller, &tool, Instant::now())
         };
@@ -544,7 +552,22 @@ impl Gateway {
                         _ => Refused::denied(&tool, "token exchange refused"),
                     }
                 })?;
-            let traceparent = traceparent(trace_id);
+            let mut started = call.event.clone();
+            started.approval = approval.map(str::to_string);
+            let audit = Arc::clone(&self.audit);
+            let recorded = crate::state::blocking(crate::state::Store::Audit, &mut call.budget, move || {
+                audit.record(&started)
+            })
+            .await;
+            if let Err(error) = recorded {
+                eprintln!("recording a started call audit event failed: {error}");
+                return Err(Refused::failed(
+                    "call audit is unavailable",
+                    audit_unavailable(),
+                ));
+            }
+            call.forwarded = true;
+            let traceparent = traceparent(&call.event.trace_id);
             let call = crate::upstream::call_tool(
                 upstream,
                 &entry.name,
@@ -793,12 +816,43 @@ impl ServerHandler for Gateway {
             .and_then(|parts| parts.extensions.get::<Principal>())
             .cloned();
         let tool = request.name.to_string();
+        let call_id = uuid::Uuid::new_v4().simple().to_string();
+        let event = CallEvent {
+            at_unix_ms: unix_ms(),
+            trace_id,
+            call_id: Some(call_id.clone()),
+            subject: principal
+                .as_ref()
+                .map_or_else(String::new, |principal| principal.subject.clone()),
+            tenant: principal
+                .as_ref()
+                .and_then(|principal| principal.tenant.clone()),
+            agent: principal
+                .as_ref()
+                .and_then(agent_id)
+                .unwrap_or_else(|| "<unknown>".into()),
+            tool,
+            decision: Decision::Started,
+            reason: None,
+            guardrail: None,
+            approval: None,
+            mitigation: None,
+            latency_ms: 0,
+            response_bytes: None,
+        };
+        // One storage budget for everything before forwarding, and for the
+        // outcome of a call refused before it (see `STORE_DEADLINE`).
+        let mut call = CallState {
+            event,
+            forwarded: false,
+            budget: crate::state::STORE_DEADLINE,
+        };
         let outcome = self
             .forward(
                 request,
                 &context,
                 principal.as_ref(),
-                &trace_id,
+                &mut call,
                 invalid_invoke,
             )
             .await;
@@ -821,37 +875,76 @@ impl ServerHandler for Gateway {
             ),
         };
         self.metrics.record_call(decision);
+        let CallState {
+            mut event,
+            forwarded,
+            mut budget,
+        } = call;
+        event.at_unix_ms = unix_ms();
+        event.decision = decision;
+        event.reason = reason;
+        event.guardrail = guardrail;
+        event.approval = approval.map(str::to_string);
+        event.mitigation = mitigation;
+        event.latency_ms = started.elapsed().as_millis();
+        event.response_bytes = response_bytes;
+        // Durable before the response, and no response without it: an
+        // unaudited answer would be a call nobody can account for. The
+        // blocking write stays off the worker and is waited for at most the
+        // rest of the call's budget, or a fresh one once the upstream ran; a
+        // write that lands after it leaves an event for a call that failed.
+        if forwarded {
+            budget = crate::state::STORE_DEADLINE;
+        }
         let audit = Arc::clone(&self.audit);
-        let event = CallEvent {
-            at_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |at| at.as_millis()),
-            trace_id,
-            subject: principal
-                .as_ref()
-                .map_or_else(String::new, |principal| principal.subject.clone()),
-            tenant: principal
-                .as_ref()
-                .and_then(|principal| principal.tenant.clone()),
-            agent: principal
-                .as_ref()
-                .and_then(agent_id)
-                .unwrap_or_else(|| "<unknown>".into()),
-            tool,
-            decision,
-            reason,
-            guardrail,
-            approval: approval.map(str::to_string),
-            mitigation,
-            latency_ms: started.elapsed().as_millis(),
-            response_bytes,
-        };
-        // Durable before the response; fsync stays off the worker.
-        let _ = tokio::task::spawn_blocking(move || audit.record(&event)).await;
+        let recorded = crate::state::blocking(crate::state::Store::Audit, &mut budget, move || {
+            audit.record(&event)
+        })
+        .await;
+        if let Err(error) = recorded {
+            eprintln!("recording call audit event failed: {error}");
+            if !forwarded {
+                return Err(audit_unavailable());
+            }
+            // The upstream may have acted: retrying could repeat it, so the
+            // caller gets no retry hint and no result, and the call id to
+            // reconcile against the `started` event.
+            return Err(McpError::internal_error(
+                format!(
+                    "the call was forwarded but its outcome could not be audited; \
+                     check call {call_id} before retrying"
+                ),
+                Some(serde_json::json!({ "call_id": call_id, "forwarded": true })),
+            ));
+        }
         outcome
             .map(|(response, _, _, _)| response)
             .map_err(|refused| *refused.error)
     }
+}
+
+/// One tool call's audit state: its `started` event (the outcome event
+/// starts as a copy), whether it was recorded and the upstream may have
+/// run, and the storage budget left before forwarding.
+struct CallState {
+    event: CallEvent,
+    forwarded: bool,
+    budget: Duration,
+}
+
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |at| at.as_millis())
+}
+
+/// Refusal of a call nothing has run for yet: safe to retry.
+fn audit_unavailable() -> McpError {
+    let retry_after_ms = crate::state::STORE_RETRY.as_millis();
+    McpError::internal_error(
+        format!("call audit is unavailable; retry after {retry_after_ms} ms"),
+        Some(serde_json::json!({ "retry_after_ms": retry_after_ms })),
+    )
 }
 
 /// Stateless Streamable HTTP service. `shutdown` ends in-flight streams.

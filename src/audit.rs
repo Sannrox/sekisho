@@ -7,7 +7,12 @@
 //! upstream call carries it in `traceparent` so the engine's receipt names
 //! the same trace.
 //!
-//! Events are stored by the state backend ([`crate::state`]). Subjects in
+//! Events are stored by the state backend ([`crate::state`]) and are durable
+//! before the call's response. A call forwarded upstream has two events with
+//! one `call_id`: `started`, written before the upstream call, and its
+//! outcome. If `started` cannot be written the call is refused with a retry
+//! hint and nothing runs; if the outcome cannot be written the call has run,
+//! so it fails without a retry hint and names its call id. Subjects in
 //! `[audit] readers` read one trace back (`GET /audit/calls`), only for their
 //! own `tenant_id`, oldest first, paged by an opaque cursor.
 //!
@@ -36,12 +41,20 @@ pub enum Decision {
     Failed,
     /// Refused by a rate limit; the caller may retry later.
     Throttled,
+    /// About to be forwarded upstream: written before the upstream call,
+    /// so a call that runs is on record even if its outcome is not. The
+    /// call's outcome follows as a second event with the same `call_id`.
+    /// Releases before #46 do not know it and skip these events on read.
+    Started,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallEvent {
     pub at_unix_ms: u128,
     pub trace_id: String,
+    /// One tool call's id, shared by its `started` and outcome events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub subject: String,
     /// Verified `tenant_id` of the caller; reads are scoped to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,12 +135,10 @@ impl CallAudit {
         self.store.read_calls(tenant, trace_id, cursor, limit)
     }
 
-    /// Record one event, durable before it returns. A write failure is
-    /// reported, not fatal to the call.
-    pub fn record(&self, event: &CallEvent) {
-        if let Err(error) = self.store.record_call(event) {
-            eprintln!("recording call audit event failed: {error}");
-        }
+    /// Record one event, durable before it returns. The gateway fails a
+    /// call whose event could not be recorded.
+    pub fn record(&self, event: &CallEvent) -> Result<(), StoreError> {
+        self.store.record_call(event)
     }
 }
 
@@ -292,6 +303,7 @@ mod tests {
         CallEvent {
             at_unix_ms: 1,
             trace_id: trace.into(),
+            call_id: None,
             subject: "user-1".into(),
             tenant: tenant.map(Into::into),
             agent: "agent-7".into(),

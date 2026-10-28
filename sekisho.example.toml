@@ -50,6 +50,11 @@ calls_file = "calls.jsonl"             # one line per tool call: caller, agent, 
 # state_dir = "cluster"                # shared rate-limit and mitigation files; replicas point here
                                        # needs a filesystem with exclusive locks shared by all replicas
 
+# [state]                             # default: backend = "directory" (the files above)
+# backend = "postgres"                # needs a build with --features postgres; covers
+# url_file = "postgres-url"           # rate limits and call audit; the file holds
+                                      # postgres://user:password@host/db?sslmode=require
+
 [limits]                               # defaults shown
 agent = { rate_per_sec = 10.0, burst = 20.0 }
 user = { rate_per_sec = 20.0, burst = 40.0 }

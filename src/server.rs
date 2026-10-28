@@ -299,7 +299,15 @@ async fn audit_calls(
 /// `unavailable`; reasons go to the log only, since they carry paths.
 async fn readyz(State(store): State<Arc<dyn crate::state::StateBackend>>) -> Response {
     let kind = store.kind();
-    let Ok(probe) = tokio::task::spawn_blocking(move || store.probe()).await else {
+    // A probe stuck past the deadline is not ready either.
+    let Ok(probe) = crate::state::blocking(
+        crate::state::Store::Limits,
+        &mut crate::state::STORE_DEADLINE.clone(),
+        move || Ok(store.probe()),
+    )
+    .await
+    else {
+        eprintln!("readiness: the probe did not answer within the store deadline");
         return (StatusCode::SERVICE_UNAVAILABLE, "readiness probe failed\n").into_response();
     };
     let mut stores = std::collections::BTreeMap::new();

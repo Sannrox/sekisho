@@ -23,7 +23,7 @@ async fn started() -> (Stack, MitigationStore) {
     let stack = Stack::start(Some(AGENTS)).await;
     stack.enable_echo().await;
     stack.enable("tools.other").await;
-    let store = MitigationStore::new(sekisho::state::open(&stack.config));
+    let store = MitigationStore::new(sekisho::state::open(&stack.config).unwrap());
     (stack, store)
 }
 
@@ -252,7 +252,7 @@ async fn replicas_configured_apart_share_the_store_in_state_dir() {
         .client_on(&b.address, serde_json::json!({ "act": "agent-7" }))
         .await;
     ready(&on_b).await;
-    MitigationStore::new(sekisho::state::open(&stack.config))
+    MitigationStore::new(sekisho::state::open(&stack.config).unwrap())
         .apply(&Standalone, echo_disabled(Scope::All), now_ms())
         .unwrap();
     let error = on_b.call_tool(echo_call("x")).await.unwrap_err();

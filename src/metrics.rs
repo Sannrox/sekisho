@@ -28,6 +28,8 @@ impl Metrics {
             Decision::Denied => 1,
             Decision::Failed => 2,
             Decision::Throttled => 3,
+            // Not an outcome; the call's outcome is counted.
+            Decision::Started => return,
         };
         self.calls[index].fetch_add(1, Ordering::Relaxed);
     }
