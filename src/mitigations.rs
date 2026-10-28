@@ -2,8 +2,9 @@
 //! an outbound destination, as a tracked change tied to a decision reference.
 //!
 //! [`MitigationStore`] keeps them in the state backend ([`crate::state`]).
-//! The rest of these notes describe the directory backend
-//! ([`MitigationFiles`]).
+//! The PostgreSQL backend commits a change and its audit events in one
+//! transaction and needs no outbox. The rest of these notes describe the
+//! directory backend ([`MitigationFiles`]).
 //!
 //! The store is one JSON file shared by every replica (`[mitigations] file`,
 //! by default in `[cluster] state_dir`). Like the rate-limit buckets it needs
@@ -270,6 +271,8 @@ pub enum MitigationError {
     Refused(String),
     #[error("mitigation store {path}: {reason}")]
     Store { path: PathBuf, reason: String },
+    #[error("mitigations: {0}")]
+    Backend(#[from] crate::state::StoreError),
 }
 
 /// What an apply or lift did. A repeat of a committed change is `Unchanged`.
@@ -294,6 +297,22 @@ pub struct State {
     /// appended at exactly this offset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_offset: Option<u64>,
+}
+
+impl State {
+    /// Every stored entry validates and is stored under its own id; any
+    /// that does not makes the whole store unreadable.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (id, mitigation) in &self.mitigations {
+            mitigation
+                .validate()
+                .map_err(|reason| format!("entry {id}: {reason}"))?;
+            if mitigation.id() != *id {
+                return Err(format!("entry {id} is stored under the wrong id"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +577,27 @@ impl MitigationStore {
     }
 }
 
+/// The audit events of importing `source`'s mitigations as the change to
+/// `generation`: one `apply` each, by `operator`, with the reason `imported`.
+#[cfg(feature = "postgres")]
+pub(crate) fn imported(
+    source: &State,
+    operator: &str,
+    generation: u64,
+    now_ms: u64,
+) -> Vec<MitigationEvent> {
+    source
+        .mitigations
+        .iter()
+        .map(|(id, mitigation)| {
+            let mut event = MitigationEvent::new(Action::Apply, id, mitigation, generation, now_ms);
+            event.operator = Some(operator.into());
+            event.reason = Some("imported".into());
+            event
+        })
+        .collect()
+}
+
 /// `event` as a refusal audit line: its own random id and the reason.
 fn refusal(mut event: MitigationEvent, reason: &str) -> MitigationEvent {
     event.event_id = format!("refuse:{}", uuid::Uuid::new_v4().simple());
@@ -626,14 +666,7 @@ impl MitigationFiles {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(error) => return Err(self.error(error)),
         };
-        for (id, mitigation) in &state.mitigations {
-            mitigation
-                .validate()
-                .map_err(|reason| self.error(format!("entry {id}: {reason}")))?;
-            if mitigation.id() != *id {
-                return Err(self.error(format!("entry {id} is stored under the wrong id")));
-            }
-        }
+        state.validate().map_err(|reason| self.error(reason))?;
         Ok(state)
     }
 

@@ -273,6 +273,20 @@ impl Stack {
         std::fs::write(&path, text + extra_toml).unwrap();
         let config = Config::load(&path).unwrap();
         let store = sekisho::state::open(&config).unwrap();
+        // The PostgreSQL backend is initialized and keeps the policy in the
+        // database; without a policy file it stays uninitialized.
+        if let (Some(_), sekisho::config::StateConfig::Postgres { .. }) =
+            (agents_toml, &config.state)
+        {
+            let (store, file) = (Arc::clone(&store), config.policy.file.clone());
+            tokio::task::spawn_blocking(move || {
+                sekisho::state::init(store.as_ref(), "test").unwrap();
+                store.set_policy(&sekisho::policy::PolicyFile::load(&file).unwrap())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
             Arc::clone(&store),
@@ -335,11 +349,10 @@ impl Stack {
             Arc::clone(&store),
         ));
         federation.refresh().await.unwrap();
-        tokio::spawn(
-            federation
-                .clone()
-                .run(Duration::from_millis(100), stop.clone()),
-        );
+        tokio::spawn(federation.clone().run(
+            Duration::from_millis(config.registry.refresh_interval_ms),
+            stop.clone(),
+        ));
         let state = Arc::new(AppState {
             verifier: Verifier::from_config(&config.verifier).unwrap(),
             metrics: Default::default(),
@@ -426,23 +439,31 @@ impl Stack {
 
     /// Wait until `tool` is in the registry, then enable it as `owner-1`.
     pub async fn enable(&self, tool: &str) {
-        let file = self.config.registry.file.clone();
+        self.owner_edit(tool, "enable", true).await;
+    }
+
+    /// Wait until `tool` is in the stored registry, then set its enabled
+    /// state as `owner-1`.
+    pub async fn owner_edit(&self, tool: &str, action: &str, enabled: bool) {
+        let store = sekisho::state::open(&self.config).unwrap();
+        let (tool, action) = (tool.to_string(), action.to_string());
+        let listed = {
+            let (store, tool) = (Arc::clone(&store), tool.clone());
+            move || store.registry().unwrap().tools.contains_key(&tool)
+        };
         assert!(
             eventually(Duration::from_secs(5), async || {
-                sekisho::registry::Registry::load(&file)
-                    .unwrap()
-                    .tools
-                    .contains_key(tool)
+                tokio::task::spawn_blocking(listed.clone()).await.unwrap()
             })
             .await
         );
-        sekisho::registry::owner_edit(
-            sekisho::state::open(&self.config).unwrap().as_ref(),
-            "owner-1",
-            "enable",
-            tool,
-            |registry| registry.set_enabled(tool, true),
-        )
+        tokio::task::spawn_blocking(move || {
+            sekisho::registry::owner_edit(store.as_ref(), "owner-1", &action, &tool, |registry| {
+                registry.set_enabled(&tool, enabled)
+            })
+        })
+        .await
+        .unwrap()
         .unwrap();
     }
 

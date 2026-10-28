@@ -7,10 +7,9 @@
 //! exclusive file locks, so replicas must share one host or a filesystem
 //! whose locks every replica sees.
 //!
-//! With the `postgres` feature, `[state] backend = "postgres"` keeps rate
-//! limits and the call audit in PostgreSQL (`state::postgres`), so replicas on
-//! separate hosts share them. Registry, policy and mitigations stay on the
-//! directory backend until #47.
+//! With the `postgres` feature, `[state] backend = "postgres"` keeps every
+//! store in PostgreSQL (`state::postgres`), so replicas on separate hosts
+//! share them.
 //!
 //! Every method blocks on storage; async callers run them on the blocking
 //! pool. A store error is an error, never an empty answer, so callers fail
@@ -33,6 +32,9 @@ use crate::registry::{AuditRecord, Registry, RegistryError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Store {
+    /// The PostgreSQL backend's initialization (`sekisho state import` or
+    /// `state init`).
+    State,
     Limits,
     Registry,
     Policy,
@@ -43,6 +45,7 @@ pub enum Store {
 impl std::fmt::Display for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::State => "state",
             Self::Limits => "rate-limit",
             Self::Registry => "registry",
             Self::Policy => "policy",
@@ -62,6 +65,10 @@ pub enum StoreError {
     },
     #[error("{store} store is not configured")]
     NotConfigured { store: Store },
+    #[error(
+        "{store} store is not initialized; run `sekisho state import --from <config>` or `sekisho state init`"
+    )]
+    Uninitialized { store: Store },
     #[error("{store} store did not answer in time")]
     Timeout { store: Store },
     #[cfg(feature = "postgres")]
@@ -232,6 +239,10 @@ pub trait StateBackend: Send + Sync {
     /// The agent policy, read fresh. Missing or unreadable is an error.
     fn policy(&self) -> Result<PolicyFile, PolicyError>;
 
+    /// Replace the agent policy after [`PolicyFile::validate`], atomically:
+    /// the next read sees the old policy or the new one.
+    fn set_policy(&self, policy: &PolicyFile) -> Result<(), PolicyError>;
+
     /// Append one call event, durable before it returns.
     fn record_call(&self, event: &CallEvent) -> Result<(), StoreError>;
 
@@ -254,6 +265,10 @@ pub trait StateBackend: Send + Sync {
         change: &mut dyn FnMut(&mut State) -> Result<Commit, MitigationError>,
     ) -> Result<(), MitigationError>;
 
+    /// Write `source` as this backend's policy, registry and mitigations,
+    /// with their audit records, all or nothing ([`import`]).
+    fn import(&self, source: &Snapshot, operator: &str, now_ms: u64) -> Result<(), ImportError>;
+
     /// Whether each store can do work now.
     fn probe(&self) -> Probe;
 }
@@ -265,7 +280,7 @@ pub fn open(config: &Config) -> Result<Arc<dyn StateBackend>, OpenError> {
         StateConfig::Directory => Ok(Arc::new(Directory::new(config))),
         #[cfg(feature = "postgres")]
         StateConfig::Postgres { url_file } => {
-            Ok(Arc::new(self::postgres::Postgres::open(config, url_file)?))
+            Ok(Arc::new(self::postgres::Postgres::open(url_file)?))
         }
         #[cfg(not(feature = "postgres"))]
         StateConfig::Postgres { .. } => Err(OpenError::NotBuilt),
@@ -274,6 +289,100 @@ pub fn open(config: &Config) -> Result<Arc<dyn StateBackend>, OpenError> {
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+
+/// Why [`import`] refused or failed. An import commits whole or not at all.
+#[derive(Debug, thiserror::Error)]
+pub enum ImportError {
+    #[error(transparent)]
+    Policy(#[from] PolicyError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Mitigations(#[from] MitigationError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("the target is already initialized; edit its state instead")]
+    AlreadyInitialized,
+    #[error("the {0} backend cannot be imported into; edit its files instead")]
+    Unsupported(&'static str),
+}
+
+/// The state [`import`] copies: policy, registry and mitigations.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub policy: PolicyFile,
+    pub registry: Registry,
+    pub mitigations: State,
+}
+
+/// What [`import`] copied.
+#[derive(Debug)]
+pub struct Imported {
+    pub agents: usize,
+    pub tools: usize,
+    pub mitigations: usize,
+}
+
+/// Copy policy, registry and mitigations from `source` (for example the
+/// directory backend, or the files a #46-era PostgreSQL deployment used)
+/// into `target`, as `operator`, in one atomic step that also initializes
+/// the target ([`StateBackend::import`]). Audit logs are not copied.
+/// Refused when the target is already initialized.
+pub fn import(
+    source: &dyn StateBackend,
+    target: &dyn StateBackend,
+    operator: &str,
+) -> Result<Imported, ImportError> {
+    let snapshot = Snapshot {
+        policy: source.policy()?,
+        registry: source.registry()?,
+        mitigations: source.mitigations()?,
+    };
+    snapshot.policy.validate()?;
+    snapshot
+        .mitigations
+        .validate()
+        .map_err(MitigationError::Invalid)?;
+    target.import(&snapshot, operator, crate::mitigations::now_ms())?;
+    Ok(Imported {
+        agents: snapshot.policy.agents.len(),
+        tools: snapshot.registry.tools.len(),
+        mitigations: snapshot.mitigations.mitigations.len(),
+    })
+}
+
+/// Initialize `target` empty, as `operator`: no agents (every call is
+/// refused until `sekisho policy import`), no tools, no mitigations.
+pub fn init(target: &dyn StateBackend, operator: &str) -> Result<(), ImportError> {
+    let empty = Snapshot {
+        policy: PolicyFile::default(),
+        registry: Registry::default(),
+        mitigations: State::default(),
+    };
+    target.import(&empty, operator, crate::mitigations::now_ms())
+}
+
+/// The mitigation state and audit records an import writes.
+#[cfg(feature = "postgres")]
+pub(crate) fn plan_import(
+    source: &Snapshot,
+    operator: &str,
+    now_ms: u64,
+) -> (State, AuditRecord, Vec<crate::mitigations::MitigationEvent>) {
+    let state = State {
+        generation: 1,
+        mitigations: source.mitigations.mitigations.clone(),
+        ..State::default()
+    };
+    let events = crate::mitigations::imported(&source.mitigations, operator, 1, now_ms);
+    let record = AuditRecord {
+        at_unix_ms: u128::from(now_ms),
+        owner: operator.into(),
+        action: "import".into(),
+        tool: "*".into(),
+    };
+    (state, record, events)
+}
 
 /// The last probe, reused for [`PROBE_TTL`].
 #[derive(Default)]
@@ -437,6 +546,49 @@ impl StateBackend for Directory {
         PolicyFile::load(&self.policy_file)
     }
 
+    /// Under an exclusive lock on `<file>.lock`, so writers on replicas
+    /// sharing the directory serialize: written to a uniquely named file
+    /// next to `[policy] file`, synced, renamed over it, and the directory
+    /// synced so the rename is durable.
+    fn set_policy(&self, policy: &PolicyFile) -> Result<(), PolicyError> {
+        policy.validate()?;
+        let failed = |reason: String| PolicyError::Unavailable {
+            path: self.policy_file.clone(),
+            reason,
+        };
+        let body = toml::to_string(policy).map_err(|error| failed(error.to_string()))?;
+        let staged = self.policy_file.with_extension(format!(
+            "{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let write = || -> std::io::Result<()> {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(self.policy_file.with_extension("lock"))?;
+            lock.lock()?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged)?;
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&staged, &self.policy_file)?;
+            // A bare filename lives in the working directory.
+            let parent = match self.policy_file.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            File::open(parent)?.sync_all()
+        };
+        write().map_err(|error| {
+            let _ = std::fs::remove_file(&staged);
+            failed(error.to_string())
+        })
+    }
+
     fn record_call(&self, event: &CallEvent) -> Result<(), StoreError> {
         self.calls.append(event).map_err(|source| StoreError::Io {
             store: Store::Audit,
@@ -468,6 +620,11 @@ impl StateBackend for Directory {
         change: &mut dyn FnMut(&mut State) -> Result<Commit, MitigationError>,
     ) -> Result<(), MitigationError> {
         self.mitigations.edit(change)
+    }
+
+    /// The directory backend's files are edited where they are.
+    fn import(&self, _: &Snapshot, _: &str, _: u64) -> Result<(), ImportError> {
+        Err(ImportError::Unsupported("directory"))
     }
 
     /// Reads every store a call needs and exercises each write path: the

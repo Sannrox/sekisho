@@ -38,11 +38,25 @@ const LISTING_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROTOCOL_VERSIONS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 
+/// How often each replica reloads the registry from the store, so an owner
+/// edit made through any replica is served everywhere within about this
+/// long, whatever `refresh_interval_ms` is.
+pub const REGISTRY_RELOAD: Duration = Duration::from_secs(1);
+/// A replica whose registry snapshot is older than this serves no tools and
+/// is not ready: a snapshot it cannot confirm may still serve a tool an owner
+/// has since disabled.
+pub const REGISTRY_STALE_AFTER: Duration = Duration::from_secs(5);
+
 /// Upstreams and the registry snapshot the data plane serves from.
 pub struct Federation {
     pub upstreams: Vec<UpstreamConfig>,
     store: Arc<dyn StateBackend>,
-    registry: RwLock<Registry>,
+    /// The last registry read or written, and when that read started.
+    registry: RwLock<(Registry, Option<Instant>)>,
+    /// Held across each reload or refresh, from the start of its store
+    /// access to publishing the result, so a replica publishes registries
+    /// in the order it read them and an older read never replaces a newer.
+    updating: tokio::sync::Mutex<()>,
 }
 
 impl Federation {
@@ -51,14 +65,57 @@ impl Federation {
             upstreams,
             store,
             registry: RwLock::default(),
+            updating: tokio::sync::Mutex::new(()),
         }
     }
 
+    /// The registry to serve: the last one loaded, or an empty one while
+    /// none was loaded within [`REGISTRY_STALE_AFTER`].
     pub fn snapshot(&self) -> Registry {
+        let registry = self
+            .registry
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match registry.1 {
+            Some(at) if at.elapsed() < REGISTRY_STALE_AFTER => registry.0.clone(),
+            _ => Registry::default(),
+        }
+    }
+
+    /// Whether no registry was loaded within [`REGISTRY_STALE_AFTER`].
+    pub fn stale(&self) -> bool {
         self.registry
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .1
+            .is_none_or(|at| at.elapsed() >= REGISTRY_STALE_AFTER)
+    }
+
+    /// Serve `registry`, read at `read_at`, unless a registry read later is
+    /// already served. Freshness counts from the read.
+    fn serve(&self, registry: Registry, read_at: Instant) {
+        let mut served = self
+            .registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if served.1.is_none_or(|at| at <= read_at) {
+            *served = (registry, Some(read_at));
+        }
+    }
+
+    /// Read the stored registry and serve it.
+    pub async fn reload(&self) -> Result<(), registry::RegistryError> {
+        let _updating = self.updating.lock().await;
+        let read_at = Instant::now();
+        let store = Arc::clone(&self.store);
+        let registry = crate::state::blocking(
+            crate::state::Store::Registry,
+            &mut crate::state::STORE_DEADLINE.clone(),
+            move || Ok(store.registry()),
+        )
+        .await??;
+        self.serve(registry, read_at);
+        Ok(())
     }
 
     /// Re-list every upstream, merge the listings into the stored registry,
@@ -82,35 +139,60 @@ impl Federation {
             });
         }
         let listings = listings.join_all().await;
-        let configured: Vec<&str> = self.upstreams.iter().map(|u| u.name.as_str()).collect();
-        let registry = self.store.edit_registry(
-            &mut |registry| {
-                registry.retain_upstreams(&configured);
-                for (upstream, listed) in &listings {
-                    registry.observe(upstream, listed);
-                }
-                Ok(())
+        let configured: Vec<String> = self.upstreams.iter().map(|u| u.name.clone()).collect();
+        let _updating = self.updating.lock().await;
+        let read_at = Instant::now();
+        let store = Arc::clone(&self.store);
+        let registry = crate::state::blocking(
+            crate::state::Store::Registry,
+            &mut crate::state::STORE_DEADLINE.clone(),
+            move || {
+                let configured: Vec<&str> = configured.iter().map(String::as_str).collect();
+                Ok(store.edit_registry(
+                    &mut |registry| {
+                        registry.retain_upstreams(&configured);
+                        for (upstream, listed) in &listings {
+                            registry.observe(upstream, listed);
+                        }
+                        Ok(())
+                    },
+                    None,
+                ))
             },
-            None,
-        )?;
-        *self
-            .registry
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = registry;
+        )
+        .await??;
+        self.serve(registry, read_at);
         Ok(())
     }
 
-    /// Refresh every `interval` until `shutdown`.
+    /// Refresh every `interval` and reload every [`REGISTRY_RELOAD`] until
+    /// `shutdown`. The reload runs on its own, so a slow refresh (an
+    /// upstream listing can take [`LISTING_TIMEOUT`]) does not hold back
+    /// owner edits or make the snapshot stale.
     pub async fn run(self: Arc<Self>, interval: Duration, shutdown: CancellationToken) {
-        loop {
-            if let Err(error) = self.refresh().await {
-                eprintln!("registry refresh failed: {error}");
+        let refreshing = async {
+            loop {
+                if let Err(error) = self.refresh().await {
+                    eprintln!("registry refresh failed: {error}");
+                }
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(interval) => {}
+                }
             }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(interval) => {}
+        };
+        let reloading = async {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = tokio::time::sleep(REGISTRY_RELOAD) => {}
+                }
+                if let Err(error) = self.reload().await {
+                    eprintln!("registry reload failed: {error}");
+                }
             }
-        }
+        };
+        tokio::join!(refreshing, reloading);
     }
 }
 
@@ -250,6 +332,11 @@ impl Gateway {
         Arc::clone(&self.store)
     }
 
+    /// The registry snapshot this replica serves, for readiness.
+    pub fn federation(&self) -> Arc<Federation> {
+        Arc::clone(&self.federation)
+    }
+
     /// The call audit, shared with the `/audit/calls` read route.
     pub fn audit(&self) -> Arc<CallAudit> {
         Arc::clone(&self.audit)
@@ -288,12 +375,37 @@ impl Gateway {
             .collect()
     }
 
-    /// The caller's agent policy, loaded fresh. Fails closed when the policy
-    /// cannot be loaded; a malformed actor matches no agent.
-    fn agent_policy(&self, principal: &Principal) -> Result<Option<AgentPolicy>, McpError> {
-        let file = self.store.policy().map_err(|error| {
+    /// The caller's agent policy, loaded fresh from the store within
+    /// `budget`. Fails closed when the policy cannot be loaded; a malformed
+    /// actor matches no agent.
+    async fn agent_policy(
+        &self,
+        principal: &Principal,
+        budget: &mut Duration,
+    ) -> Result<Option<AgentPolicy>, McpError> {
+        let store = Arc::clone(&self.store);
+        let loaded = crate::state::blocking(crate::state::Store::Policy, budget, move || {
+            Ok(store.policy())
+        })
+        .await
+        .map_err(crate::policy::PolicyError::from)
+        .and_then(|policy| policy);
+        let file = loaded.map_err(|error| {
             eprintln!("{error}");
-            McpError::internal_error("agent policy is unavailable", None)
+            match error {
+                // Fails closed until an operator initializes the store; the
+                // caller may retry meanwhile.
+                crate::policy::PolicyError::Store(
+                    error @ crate::state::StoreError::Uninitialized { .. },
+                ) => {
+                    let retry_after_ms = crate::state::STORE_RETRY.as_millis();
+                    McpError::internal_error(
+                        format!("{error}; retry after {retry_after_ms} ms"),
+                        Some(serde_json::json!({ "retry_after_ms": retry_after_ms })),
+                    )
+                }
+                _ => McpError::internal_error("agent policy is unavailable", None),
+            }
         })?;
         Ok(agent_id(principal).and_then(|id| file.agent(&id).cloned()))
     }
@@ -324,7 +436,8 @@ impl Gateway {
         let tool = request.name.to_string();
         let principal = principal.ok_or_else(|| Refused::denied(&tool, "no verified principal"))?;
         let agent = self
-            .agent_policy(principal)
+            .agent_policy(principal, &mut call.budget)
+            .await
             .map_err(|error| Refused {
                 decision: Decision::Denied,
                 reason: "agent policy is unavailable".into(),
@@ -440,22 +553,23 @@ impl Gateway {
             let (key, upstream_name, url) =
                 (tool.clone(), entry.upstream.clone(), upstream.url.clone());
             let (agent_id, tenant) = (agent.id.clone(), principal.tenant.clone());
-            let checked = tokio::task::spawn_blocking(move || {
-                let call = crate::mitigations::Call {
-                    tool: &key,
-                    upstream: &upstream_name,
-                    url: &url,
-                    agent: &agent_id,
-                    tenant: tenant.as_deref(),
-                };
-                store.check(&call, crate::mitigations::now_ms())
-            })
+            let checked = crate::state::blocking(
+                crate::state::Store::Mitigations,
+                &mut call.budget,
+                move || {
+                    let call = crate::mitigations::Call {
+                        tool: &key,
+                        upstream: &upstream_name,
+                        url: &url,
+                        agent: &agent_id,
+                        tenant: tenant.as_deref(),
+                    };
+                    Ok(store.check(&call, crate::mitigations::now_ms()))
+                },
+            )
             .await
-            .unwrap_or_else(|error| {
-                Err(crate::mitigations::MitigationError::Invalid(
-                    error.to_string(),
-                ))
-            });
+            .map_err(crate::mitigations::MitigationError::from)
+            .and_then(|checked| checked);
             match checked {
                 Ok(None) => {}
                 Ok(Some(mitigation)) => return Err(Refused::mitigated(&tool, &mitigation)),
@@ -763,7 +877,9 @@ impl ServerHandler for Gateway {
             .get::<axum::http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<Principal>())
             .ok_or_else(|| McpError::internal_error("request has no verified principal", None))?;
-        let agent = self.agent_policy(principal)?;
+        let agent = self
+            .agent_policy(principal, &mut crate::state::STORE_DEADLINE.clone())
+            .await?;
         let mut tools = discovery::meta_tools();
         if !self.progressive {
             tools.extend(
@@ -966,4 +1082,71 @@ pub fn service(
         Arc::new(NeverSessionManager::default()),
         http,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot nobody could confirm within the bound serves no tools,
+    /// and the next good reload serves the stored registry again.
+    #[tokio::test]
+    async fn a_stale_registry_snapshot_serves_nothing_until_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn StateBackend> = Arc::new(crate::state::Directory::in_dir(dir.path()));
+        let mut stored = Registry::default();
+        stored.observe(
+            "tools",
+            &[(
+                "echo".into(),
+                registry::ToolVersion {
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                },
+            )],
+        );
+        let file = dir.path().join("registry.json");
+        std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let federation = Federation::new(Vec::new(), store);
+        assert!(federation.stale(), "nothing loaded yet");
+        federation.reload().await.unwrap();
+        assert!(!federation.stale());
+        assert_eq!(federation.snapshot(), stored);
+
+        // Loaded too long ago, and the store cannot be read now.
+        federation.registry.write().unwrap().1 = Instant::now().checked_sub(REGISTRY_STALE_AFTER);
+        std::fs::write(&file, "not-json").unwrap();
+        assert!(federation.reload().await.is_err());
+        assert!(federation.stale());
+        assert!(federation.snapshot().tools.is_empty());
+
+        std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+        federation.reload().await.unwrap();
+        assert_eq!(federation.snapshot(), stored);
+    }
+
+    /// A registry read earlier than the one served never replaces it.
+    #[test]
+    fn an_older_read_is_not_served_over_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let federation = Federation::new(
+            Vec::new(),
+            Arc::new(crate::state::Directory::in_dir(dir.path())),
+        );
+        let older = Instant::now();
+        let mut newer = Registry::default();
+        newer.observe(
+            "tools",
+            &[(
+                "echo".into(),
+                registry::ToolVersion {
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                },
+            )],
+        );
+        federation.serve(newer.clone(), Instant::now());
+        federation.serve(Registry::default(), older);
+        assert_eq!(federation.snapshot(), newer);
+    }
 }

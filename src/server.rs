@@ -108,7 +108,7 @@ pub fn router(
         }));
     let readiness = Router::new()
         .route("/readyz", get(readyz))
-        .with_state(gateway.state());
+        .with_state((gateway.state(), gateway.federation()));
     let mcp_service = Router::new()
         .nest_service("/mcp", crate::gateway::service(mcp, gateway, shutdown))
         .layer(middleware::from_fn_with_state(auth, require_bearer));
@@ -296,8 +296,15 @@ async fn audit_calls(
 
 /// `GET /readyz`: 200 when every store of the state backend can do work,
 /// else 503. The body names the backend and each store as `ok` or
-/// `unavailable`; reasons go to the log only, since they carry paths.
-async fn readyz(State(store): State<Arc<dyn crate::state::StateBackend>>) -> Response {
+/// `unavailable`; reasons go to the log only, since they carry paths. The
+/// registry also counts as unavailable while this replica's registry
+/// snapshot is stale ([`crate::gateway::REGISTRY_STALE_AFTER`]).
+async fn readyz(
+    State((store, federation)): State<(
+        Arc<dyn crate::state::StateBackend>,
+        Arc<crate::gateway::Federation>,
+    )>,
+) -> Response {
     let kind = store.kind();
     // A probe stuck past the deadline is not ready either.
     let Ok(probe) = crate::state::blocking(
@@ -315,7 +322,16 @@ async fn readyz(State(store): State<Arc<dyn crate::state::StateBackend>>) -> Res
         if let Err(reason) = &result {
             eprintln!("readiness: {name} store unavailable: {reason}");
         }
-        stores.insert(name, if result.is_ok() { "ok" } else { "unavailable" });
+        let status = match (&result, name) {
+            (Ok(()), _) => "ok",
+            (Err(_), crate::state::Store::State) => "uninitialized",
+            (Err(_), _) => "unavailable",
+        };
+        stores.insert(name, status);
+    }
+    if federation.stale() {
+        eprintln!("readiness: the registry snapshot is stale");
+        stores.insert(crate::state::Store::Registry, "unavailable");
     }
     let ready = stores.values().all(|state| *state == "ok");
     let status = if ready {

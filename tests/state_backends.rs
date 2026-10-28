@@ -247,6 +247,107 @@ async fn an_outcome_write_failure_fails_without_a_retry_hint(backend: Backend) {
     assert_eq!(stack.seen.lock().unwrap().len(), upstream_calls + 1);
 }
 
+/// A stored policy is replaced whole, and an invalid one is refused and
+/// changes nothing.
+async fn a_policy_import_replaces_the_policy_or_nothing(backend: Backend) {
+    let stack = Stack::start_with(Some(AGENTS), &backend.toml("")).await;
+    let store = sekisho::state::open(&stack.config).unwrap();
+    let agents = |ids: &[&str]| sekisho::policy::PolicyFile {
+        agents: ids
+            .iter()
+            .map(|id| sekisho::policy::AgentPolicy {
+                id: (*id).into(),
+                tools: vec!["tools.echo".into()],
+                ceiling: Vec::new(),
+                guardrails: None,
+            })
+            .collect(),
+    };
+    let (two, duplicate) = (agents(&["agent-7", "agent-8"]), agents(&["a", "a"]));
+    let stored = tokio::task::spawn_blocking(move || {
+        store.set_policy(&two).unwrap();
+        let refused = store.set_policy(&duplicate);
+        (refused, store.policy().unwrap())
+    })
+    .await
+    .unwrap();
+    assert!(stored.0.is_err(), "duplicate agents are refused");
+    let ids: Vec<_> = stored
+        .1
+        .agents
+        .iter()
+        .map(|agent| agent.id.clone())
+        .collect();
+    assert_eq!(ids, ["agent-7", "agent-8"]);
+}
+
+/// Owner edits of different tools through two replicas at once both land.
+async fn concurrent_registry_edits_from_two_replicas_both_land(backend: Backend) {
+    let stack = Stack::start_with(Some(AGENTS), &backend.toml("")).await;
+    stack.enable("tools.other").await;
+    stack.owner_edit("tools.other", "disable", false).await;
+    let config = stack.config.clone();
+    let registry = tokio::task::spawn_blocking(move || {
+        std::thread::scope(|scope| {
+            for tool in ["tools.echo", "tools.other"] {
+                let config = &config;
+                scope.spawn(move || {
+                    let store = sekisho::state::open(config).unwrap();
+                    sekisho::registry::owner_edit(store.as_ref(), "owner-1", "enable", tool, |r| {
+                        r.set_enabled(tool, true)
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        sekisho::state::open(&config).unwrap().registry().unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(registry.tools["tools.echo"].enabled && registry.tools["tools.other"].enabled);
+}
+
+/// A mitigation applied through one replica refuses the next call on
+/// another, and lifting it lets the next call through.
+async fn a_mitigation_through_one_replica_applies_on_another(backend: Backend) {
+    use sekisho::mitigations::{Mitigation, MitigationStore, Scope, Standalone, Target, now_ms};
+    let stack = Stack::start_with(Some(AGENTS), &backend.toml("")).await;
+    stack.enable_echo().await;
+    let other = stack.extra_gateway().await;
+    let client = stack
+        .client_on(&other.address, serde_json::json!({ "act": "agent-7" }))
+        .await;
+    first_call(&client).await;
+    let store = MitigationStore::new(sekisho::state::open(&stack.config).unwrap());
+    let applied = store.clone();
+    let id = tokio::task::spawn_blocking(move || {
+        let mitigation = Mitigation {
+            decision: "INC-1".into(),
+            operator: "ops-1".into(),
+            target: Target::Tool {
+                tool: "tools.echo".into(),
+            },
+            scope: Scope::All,
+            applied_at_unix_ms: 0,
+            expires_at_unix_ms: None,
+        };
+        applied.apply(&Standalone, mitigation, now_ms()).unwrap().0
+    })
+    .await
+    .unwrap();
+    let error = client.call_tool(echo_call("refused")).await.unwrap_err();
+    assert!(format!("{error:?}").contains("disabled"), "{error:?}");
+    tokio::task::spawn_blocking(move || {
+        store
+            .lift(&Standalone, &id, "INC-1-close", "ops-1", now_ms())
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    client.call_tool(echo_call("again")).await.unwrap();
+    let _ = client.cancel().await;
+}
+
 macro_rules! conformance {
     ($($case:ident),* $(,)?) => {
         mod directory {
@@ -278,6 +379,9 @@ conformance!(
     a_call_is_audited_before_it_answers,
     a_started_write_failure_refuses_before_the_upstream,
     an_outcome_write_failure_fails_without_a_retry_hint,
+    a_policy_import_replaces_the_policy_or_nothing,
+    concurrent_registry_edits_from_two_replicas_both_land,
+    a_mitigation_through_one_replica_applies_on_another,
 );
 
 #[cfg(feature = "postgres")]
@@ -426,9 +530,9 @@ mod pg {
         let error = client.call_tool(echo_call("down")).await.unwrap_err();
         assert!(format!("{error:?}").contains("retry after"), "{error:?}");
         let body = readiness_settles(&stack.address, 503).await;
-        assert_eq!(body["stores"]["limits"], "unavailable", "{body}");
-        assert_eq!(body["stores"]["audit"], "unavailable", "{body}");
-        assert_eq!(body["stores"]["policy"], "ok", "{body}");
+        for store in ["limits", "audit", "policy", "registry", "mitigations"] {
+            assert_eq!(body["stores"][store], "unavailable", "{body}");
+        }
         assert!(!body.to_string().contains(&db.name), "no details: {body}");
 
         db.outage(false);
@@ -473,7 +577,7 @@ mod pg {
         // A duplicate version would violate the primary key; check the set.
         db.execute(
             "DO $$ BEGIN
-               IF (SELECT array_agg(version ORDER BY version) FROM sekisho_schema_migrations) <> ARRAY[1]
+               IF (SELECT array_agg(version ORDER BY version) FROM sekisho_schema_migrations) <> ARRAY[1, 2]
                THEN RAISE EXCEPTION 'unexpected schema versions'; END IF;
              END $$",
         );
@@ -607,7 +711,7 @@ mod pg {
                 result.as_ref().err().map(|reason| (*store, reason.clone()))
             })
             .collect();
-        assert_eq!(unavailable.len(), 2, "{unavailable:?}");
+        assert_eq!(unavailable.len(), 5, "every store: {unavailable:?}");
         assert!(
             unavailable
                 .iter()
@@ -671,5 +775,215 @@ mod pg {
                THEN RAISE EXCEPTION 'unexpected sweep'; END IF;
              END $$",
         );
+    }
+
+    /// Acceptance for #47: an owner edit made through replica A is served by
+    /// replica B, which re-lists upstreams only once a minute, within the
+    /// registry reload bound.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registry_edit_through_one_replica_reaches_another_within_the_bound() {
+        let Some(db) = TestDb::create() else {
+            return;
+        };
+        let backend = Backend::Postgres(Box::new(db));
+        let stack = Stack::start_with(Some(AGENTS), &backend.toml("")).await;
+        stack.enable_echo().await;
+        let mut slow = stack.config.clone();
+        slow.registry.refresh_interval_ms = 60_000;
+        let b = stack.replica(&slow).await;
+        let client = stack
+            .client_on(&b.address, serde_json::json!({ "act": "agent-7" }))
+            .await;
+        first_call(&client).await;
+        let bound = sekisho::gateway::REGISTRY_RELOAD + Duration::from_millis(1_500);
+
+        stack.owner_edit("tools.echo", "disable", false).await;
+        let started = Instant::now();
+        assert!(
+            eventually(bound, async || client
+                .call_tool(echo_call("off"))
+                .await
+                .is_err())
+            .await,
+            "disabled on B within {bound:?}"
+        );
+        stack.owner_edit("tools.echo", "enable", true).await;
+        assert!(
+            eventually(bound, async || client
+                .call_tool(echo_call("on"))
+                .await
+                .is_ok())
+            .await
+        );
+        assert!(started.elapsed() < bound * 2);
+        let _ = client.cancel().await;
+    }
+
+    /// A mitigation change and its audit event commit together: when the
+    /// event cannot be written the change is not made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mitigation_change_commits_with_its_audit_event_or_not_at_all() {
+        use sekisho::mitigations::{
+            Mitigation, MitigationStore, Scope, Standalone, Target, now_ms,
+        };
+        let Some(db) = TestDb::create() else {
+            return;
+        };
+        let backend = Backend::Postgres(Box::new(db));
+        let stack = Stack::start_with(Some(AGENTS), &backend.toml("")).await;
+        let Backend::Postgres(db) = &backend else {
+            unreachable!()
+        };
+        let store = MitigationStore::new(sekisho::state::open(&stack.config).unwrap());
+        let mitigation = Mitigation {
+            decision: "INC-2".into(),
+            operator: "ops-1".into(),
+            target: Target::Upstream {
+                upstream: "tools".into(),
+            },
+            scope: Scope::All,
+            applied_at_unix_ms: 0,
+            expires_at_unix_ms: None,
+        };
+        let apply = |store: MitigationStore, mitigation: Mitigation| {
+            std::thread::spawn(move || store.apply(&Standalone, mitigation, now_ms()))
+                .join()
+                .unwrap()
+        };
+        let load = |store: MitigationStore| {
+            std::thread::spawn(move || store.load().unwrap())
+                .join()
+                .unwrap()
+        };
+        let initial = load(store.clone());
+        assert!(initial.mitigations.is_empty());
+        db.execute(
+            "ALTER TABLE sekisho_mitigation_audit ADD CONSTRAINT refuse CHECK (false) NOT VALID",
+        );
+        assert!(apply(store.clone(), mitigation.clone()).is_err());
+        let state = load(store.clone());
+        assert!(
+            state.mitigations.is_empty() && state.generation == initial.generation,
+            "{state:?}"
+        );
+
+        db.execute("ALTER TABLE sekisho_mitigation_audit DROP CONSTRAINT refuse");
+        apply(store.clone(), mitigation).unwrap();
+        assert_eq!(load(store).generation, initial.generation + 1);
+        db.execute(
+            "DO $$ BEGIN
+               IF (SELECT count(*) FROM sekisho_mitigation_audit) <> 1
+               THEN RAISE EXCEPTION 'expected one audit event'; END IF;
+             END $$",
+        );
+    }
+
+    /// `state import` copies a directory backend's policy, registry and
+    /// mitigations in one transaction: a failure part way leaves the target
+    /// untouched and the import can be retried; once done, it is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_directory_backend_imports_into_postgres_whole_or_not_at_all() {
+        use sekisho::mitigations::{
+            Mitigation, MitigationStore, Scope, Standalone, Target, now_ms,
+        };
+        let Some(db) = TestDb::create() else {
+            return;
+        };
+        let source = Stack::start_with(Some(AGENTS), &Backend::Directory.toml("")).await;
+        source.enable_echo().await;
+        let mut target = source.config.clone();
+        target.state = sekisho::config::StateConfig::Postgres {
+            url_file: db.url_file.clone(),
+        };
+        let migrate = target.clone();
+        let (from, to) = (source.config.clone(), target);
+        let import = move || {
+            let source = sekisho::state::open(&from).unwrap();
+            let target = sekisho::state::open(&to).unwrap();
+            let imported = sekisho::state::import(source.as_ref(), target.as_ref(), "ops-1");
+            let policy = target.policy();
+            (imported, target.registry(), policy)
+        };
+        let applied = MitigationStore::new(sekisho::state::open(&source.config).unwrap());
+        tokio::task::spawn_blocking(move || {
+            let mitigation = Mitigation {
+                decision: "INC-3".into(),
+                operator: "ops-1".into(),
+                target: Target::Tool {
+                    tool: "tools.other".into(),
+                },
+                scope: Scope::All,
+                applied_at_unix_ms: 0,
+                expires_at_unix_ms: None,
+            };
+            applied.apply(&Standalone, mitigation, now_ms()).unwrap();
+        })
+        .await
+        .unwrap();
+        // Migrate the target, then fail its last write: the mitigation audit.
+        tokio::task::spawn_blocking(move || sekisho::state::open(&migrate).unwrap().probe())
+            .await
+            .unwrap();
+        db.execute(
+            "ALTER TABLE sekisho_mitigation_audit ADD CONSTRAINT refuse CHECK (false) NOT VALID",
+        );
+        let (failed, registry, policy) = tokio::task::spawn_blocking(import.clone()).await.unwrap();
+        assert!(failed.is_err());
+        assert!(registry.is_err(), "still uninitialized");
+        assert!(policy.is_err(), "no policy stored");
+
+        db.execute("ALTER TABLE sekisho_mitigation_audit DROP CONSTRAINT refuse");
+        let (first, registry, policy) = tokio::task::spawn_blocking(import.clone()).await.unwrap();
+        let first = first.unwrap();
+        assert_eq!((first.agents, first.mitigations), (1, 1));
+        assert!(registry.unwrap().tools["tools.echo"].enabled);
+        assert_eq!(policy.unwrap().agents[0].id, "agent-7");
+        let (second, _, _) = tokio::task::spawn_blocking(import).await.unwrap();
+        assert!(second.is_err(), "a second import is refused");
+    }
+
+    /// An uninitialized store (a fresh database, or one a #46-era
+    /// deployment used for limits and audit only) refuses every call with
+    /// a retry hint naming the command, is not ready, and refuses a policy
+    /// import; `state init` and a policy import make it serve.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uninitialized_store_refuses_calls_until_initialized() {
+        let Some(db) = TestDb::create() else {
+            return;
+        };
+        let backend = Backend::Postgres(Box::new(db));
+        // No policy file: the stack leaves the store uninitialized.
+        let stack = Stack::start_with(None, &backend.toml("")).await;
+        let client = stack.client(serde_json::json!({ "act": "agent-7" })).await;
+        let error = client.call_tool(echo_call("early")).await.unwrap_err();
+        let text = format!("{error:?}");
+        assert!(
+            text.contains("sekisho state init") && text.contains("retry after"),
+            "{text}"
+        );
+        let body = readiness_settles(&stack.address, 503).await;
+        assert_eq!(body["stores"]["state"], "uninitialized", "{body}");
+
+        let store = sekisho::state::open(&stack.config).unwrap();
+        let policy: sekisho::policy::PolicyFile = toml::from_str(AGENTS).unwrap();
+        let refused = {
+            let (store, policy) = (Arc::clone(&store), policy.clone());
+            tokio::task::spawn_blocking(move || store.set_policy(&policy))
+                .await
+                .unwrap()
+        };
+        assert!(refused.is_err(), "a policy alone does not initialize");
+
+        tokio::task::spawn_blocking(move || {
+            sekisho::state::init(store.as_ref(), "ops-1").unwrap();
+            store.set_policy(&policy).unwrap();
+        })
+        .await
+        .unwrap();
+        stack.enable_echo().await;
+        let body = readiness_settles(&stack.address, 200).await;
+        assert_eq!(body["stores"]["state"], "ok", "{body}");
+        first_call(&client).await;
+        let _ = client.cancel().await;
     }
 }

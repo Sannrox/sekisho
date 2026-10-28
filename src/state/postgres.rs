@@ -1,8 +1,17 @@
-//! The PostgreSQL backend (#46): rate-limit buckets and the call audit in
-//! one database that replicas on separate hosts share. Registry, policy and
-//! mitigations stay on the directory backend until #47, so this backend
-//! wraps a [`Directory`] for them.
+//! The PostgreSQL backend (#46, #47): every store in one database that
+//! replicas on separate hosts share.
 //!
+//! - **Registry, policy, mitigations.** One JSON document each in
+//!   `sekisho_state`. An edit is one transaction that locks the document's
+//!   row, applies the same change code as the directory backend, writes it
+//!   and inserts its audit records (owner edits, mitigation events), so a
+//!   change and its audit commit together or not at all. Reads take no
+//!   lock. Policy and mitigations are read on every call, so a change
+//!   applies to the next call on every replica; the registry is reloaded by
+//!   every replica's [`crate::gateway::Federation`]. The documents do not
+//!   exist until `sekisho state import` or `state init` writes all three
+//!   with an `initialized` marker in one transaction; until then every read
+//!   and edit fails as uninitialized, so calls are refused.
 //! - **Rate limits.** One transaction per charge creates missing bucket rows
 //!   full and locks every bucket row of the call in one upsert (in key order
 //!   so concurrent charges cannot deadlock), runs the same arithmetic as the
@@ -41,9 +50,10 @@ use ::postgres::types::Type;
 use ::postgres::{Client, Error};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
-use super::{Bucket, Directory, OpenError, Probe, ProbeCache, StateBackend, Store, StoreError};
+use super::{
+    Bucket, ImportError, OpenError, Probe, ProbeCache, Snapshot, StateBackend, Store, StoreError,
+};
 use crate::audit::{CallEvent, CallPage, MAX_PAGE};
-use crate::config::Config;
 use crate::limits::{FileBucket, FileStore};
 use crate::mitigations::{Commit, MitigationError, State};
 use crate::policy::{PolicyError, PolicyFile};
@@ -85,9 +95,10 @@ const MIGRATION_LOCK: i64 = 0x0053_454b_4953_484f;
 
 /// Schema versions, applied in order. Additive only: replicas of an older
 /// release keep running against a newer schema during a rolling deploy.
-const MIGRATIONS: &[(i32, &str)] = &[(
-    1,
-    "CREATE TABLE sekisho_rate_buckets (
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        1,
+        "CREATE TABLE sekisho_rate_buckets (
         key text PRIMARY KEY,
         tokens double precision NOT NULL,
         at_ms bigint NOT NULL,
@@ -101,11 +112,25 @@ const MIGRATIONS: &[(i32, &str)] = &[(
         event jsonb NOT NULL,
         PRIMARY KEY (trace_id, seq)
     );",
-)];
+    ),
+    (
+        2,
+        "CREATE TABLE sekisho_state (
+        name text PRIMARY KEY,
+        body jsonb NOT NULL
+    );
+    CREATE TABLE sekisho_registry_audit (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        record jsonb NOT NULL
+    );
+    CREATE TABLE sekisho_mitigation_audit (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        event jsonb NOT NULL
+    );",
+    ),
+];
 
 pub struct Postgres {
-    /// Registry, policy and mitigations, until #47.
-    files: Directory,
     pool: Pool,
     probed: ProbeCache,
     /// Wall time of the last bucket sweep; 0 sweeps on the first charge.
@@ -114,7 +139,7 @@ pub struct Postgres {
 
 impl Postgres {
     /// Read the connection URL from `url_file`. Connects nothing yet.
-    pub(crate) fn open(config: &Config, url_file: &Path) -> Result<Self, OpenError> {
+    pub(crate) fn open(url_file: &Path) -> Result<Self, OpenError> {
         let url = std::fs::read_to_string(url_file).map_err(|source| OpenError::UrlFile {
             path: url_file.into(),
             source,
@@ -131,10 +156,6 @@ impl Postgres {
         #[cfg(target_os = "linux")]
         pg.tcp_user_timeout(KEEPALIVE_IDLE);
         Ok(Self {
-            files: Directory {
-                limits_file: None,
-                ..Directory::new(config)
-            },
             pool: Pool::new(pg, tls()?),
             probed: ProbeCache::default(),
             swept_ms: AtomicU64::new(0),
@@ -171,26 +192,169 @@ impl Postgres {
         }
     }
 
-    /// The write paths of both stores on one pooled connection, each in a
+    /// Every store on one pooled connection, each write path in a
     /// transaction that is rolled back: a bucket row is inserted and locked
-    /// as a charge would, and an audit event is appended to a probe trace
-    /// of its own. No real row or trace lock is touched.
+    /// as a charge would; an audit event is appended to a probe trace of its
+    /// own; the registry and mitigation documents are locked, parsed and
+    /// rewritten unchanged, with a probe audit record; the policy is read
+    /// and validated. Nothing is committed.
     fn probe_now(&self) -> Probe {
         let checked = self.pool.with(Store::Limits, |client| {
-            let limits = probe_limits(client);
-            let audit = probe_audit(client);
-            Ok((limits, audit))
+            let mut stores = Vec::new();
+            // Reported only when known: "uninitialized" means exactly that.
+            if let Some(initialized) = probe_initialized(client) {
+                stores.push((Store::State, initialized));
+            }
+            stores.extend([
+                (Store::Policy, probe_document(client, Store::Policy)),
+                (Store::Registry, probe_document(client, Store::Registry)),
+                (
+                    Store::Mitigations,
+                    probe_document(client, Store::Mitigations),
+                ),
+                (Store::Audit, probe_audit(client).map_err(|e| detail(&e))),
+                (Store::Limits, probe_limits(client).map_err(|e| detail(&e))),
+            ]);
+            Ok(stores)
         });
-        let reason = |error: Error| detail(&error);
-        let (limits, audit) = match checked {
-            Ok((limits, audit)) => (limits.map_err(reason), audit.map_err(reason)),
-            Err(error) => (Err(error.to_string()), Err(error.to_string())),
-        };
-        let mut stores = self.files.probe_files();
-        stores.push((Store::Audit, audit));
-        stores.push((Store::Limits, limits));
-        stores
+        match checked {
+            Ok(stores) => stores,
+            Err(error) => [
+                Store::Policy,
+                Store::Registry,
+                Store::Mitigations,
+                Store::Audit,
+                Store::Limits,
+            ]
+            .into_iter()
+            .map(|store| {
+                // The connection failed, not one store.
+                let reason = match &error {
+                    StoreError::Postgres { source, .. } => detail(source),
+                    other => other.to_string(),
+                };
+                (store, Err(reason))
+            })
+            .collect(),
+        }
     }
+}
+
+/// The document a store keeps in `sekisho_state`, and its audit table.
+fn document(store: Store) -> (&'static str, Option<(&'static str, &'static str)>) {
+    match store {
+        Store::Registry => ("registry", Some(("sekisho_registry_audit", "record"))),
+        Store::Mitigations => ("mitigations", Some(("sekisho_mitigation_audit", "event"))),
+        _ => ("policy", None),
+    }
+}
+
+/// Whether `state import` or `state init` initialized the store; `None`
+/// when that cannot be read (the other stores report why).
+fn probe_initialized(client: &mut Client) -> Option<Result<(), String>> {
+    match read_unlocked(client, "initialized") {
+        Ok(Some(_)) => Some(Ok(())),
+        Ok(None) => Some(Err(StoreError::Uninitialized {
+            store: Store::State,
+        }
+        .to_string())),
+        Err(_) => None,
+    }
+}
+
+/// A document store's write path, rolled back: see [`Postgres::probe_now`].
+fn probe_document(client: &mut Client, store: Store) -> Result<(), String> {
+    let (name, audit) = document(store);
+    let mut tx = client.transaction().map_err(|e| detail(&e))?;
+    let body = read_document(&mut tx, name, audit.is_some()).map_err(|e| detail(&e))?;
+    let parsed = match (store, body) {
+        (_, None) => Err(StoreError::Uninitialized { store }.to_string()),
+        (Store::Policy, Some(body)) => serde_json::from_value::<PolicyFile>(body)
+            .map_err(|e| e.to_string())
+            .and_then(|policy| policy.validate().map_err(|e| e.to_string()))
+            .map(|()| None),
+        (Store::Registry, Some(body)) => serde_json::from_value::<Registry>(body)
+            .map(|registry| Some(serde_json::json!(registry)))
+            .map_err(|e| e.to_string()),
+        (_, Some(body)) => serde_json::from_value::<State>(body)
+            .map_err(|e| e.to_string())
+            .and_then(|state| state.validate().map(|()| Some(serde_json::json!(state)))),
+    }?;
+    if let (Some(body), Some((table, column))) = (parsed, audit) {
+        write_document(&mut tx, name, &body).map_err(|e| detail(&e))?;
+        tx.query_typed(
+            &format!("INSERT INTO {table} ({column}) VALUES ('{{}}')"),
+            &[],
+        )
+        .map_err(|e| detail(&e))?;
+    }
+    tx.rollback().map_err(|e| detail(&e))
+}
+
+/// The stored document `name`, locked for this transaction when `lock`.
+fn read_document(
+    tx: &mut ::postgres::Transaction<'_>,
+    name: &str,
+    lock: bool,
+) -> Result<Option<serde_json::Value>, Error> {
+    let sql = if lock {
+        "SELECT body FROM sekisho_state WHERE name = $1 FOR UPDATE"
+    } else {
+        "SELECT body FROM sekisho_state WHERE name = $1"
+    };
+    tx.query_typed_opt(sql, &[(&name, Type::TEXT)])?
+        .map(|row| row.try_get(0))
+        .transpose()
+}
+
+/// Replace the stored document `name`; `false` when there is none, that is
+/// the store is not initialized.
+fn write_document(
+    tx: &mut ::postgres::Transaction<'_>,
+    name: &str,
+    body: &serde_json::Value,
+) -> Result<bool, Error> {
+    let rows = tx.query_typed(
+        "UPDATE sekisho_state SET body = $2 WHERE name = $1 RETURNING name",
+        &[(&name, Type::TEXT), (body, Type::JSONB)],
+    )?;
+    Ok(!rows.is_empty())
+}
+
+/// Insert the document `name`; fails when it exists.
+fn insert_document(
+    tx: &mut ::postgres::Transaction<'_>,
+    name: &str,
+    body: &serde_json::Value,
+) -> Result<(), Error> {
+    tx.query_typed(
+        "INSERT INTO sekisho_state (name, body) VALUES ($1, $2)",
+        &[(&name, Type::TEXT), (body, Type::JSONB)],
+    )?;
+    Ok(())
+}
+
+/// Insert `rows` into the audit table of a document store.
+fn append_audit(
+    tx: &mut ::postgres::Transaction<'_>,
+    store: Store,
+    rows: &[serde_json::Value],
+) -> Result<(), Error> {
+    if let (_, Some((table, column))) = document(store) {
+        tx.query_typed(
+            &format!("INSERT INTO {table} ({column}) SELECT unnest($1::jsonb[])"),
+            &[(&rows, Type::JSONB_ARRAY)],
+        )?;
+    }
+    Ok(())
+}
+
+/// A document read without a lock, in a transaction of its own.
+fn read_unlocked(client: &mut Client, name: &str) -> Result<Option<serde_json::Value>, Error> {
+    let mut tx = client.transaction()?;
+    let body = read_document(&mut tx, name, false)?;
+    tx.commit()?;
+    Ok(body)
 }
 
 fn probe_limits(client: &mut Client) -> Result<(), Error> {
@@ -335,19 +499,90 @@ impl StateBackend for Postgres {
     }
 
     fn registry(&self) -> Result<Registry, RegistryError> {
-        self.files.registry()
+        let body = self
+            .run(Store::Registry, |client| read_unlocked(client, "registry"))?
+            .ok_or(StoreError::Uninitialized {
+                store: Store::Registry,
+            })?;
+        serde_json::from_value(body)
+            .map_err(|error| RegistryError::Invalid(format!("stored registry: {error}")))
     }
 
+    /// Locks the registry row; writes it only when `change` changed it.
     fn edit_registry(
         &self,
         change: &mut dyn FnMut(&mut Registry) -> Result<(), RegistryError>,
         audit: Option<&AuditRecord>,
     ) -> Result<Registry, RegistryError> {
-        self.files.edit_registry(change, audit)
+        let invalid = |what: &str, error: serde_json::Error| {
+            RegistryError::Invalid(format!("{what} registry: {error}"))
+        };
+        let record = audit
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| invalid("auditing a", error))?;
+        self.run(Store::Registry, |client| {
+            let mut tx = client.transaction()?;
+            let Some(body) = read_document(&mut tx, "registry", true)? else {
+                return Ok(Err(StoreError::Uninitialized {
+                    store: Store::Registry,
+                }
+                .into()));
+            };
+            let mut registry: Registry = match serde_json::from_value(body) {
+                Ok(registry) => registry,
+                Err(error) => return Ok(Err(invalid("stored", error))),
+            };
+            let before = registry.clone();
+            if let Err(error) = change(&mut registry) {
+                return Ok(Err(error));
+            }
+            if registry != before {
+                let body = match serde_json::to_value(&registry) {
+                    Ok(body) => body,
+                    Err(error) => return Ok(Err(invalid("writing the", error))),
+                };
+                write_document(&mut tx, "registry", &body)?;
+            }
+            if let Some(record) = &record {
+                append_audit(&mut tx, Store::Registry, std::slice::from_ref(record))?;
+            }
+            tx.commit()?;
+            Ok(Ok(registry))
+        })?
     }
 
     fn policy(&self) -> Result<PolicyFile, PolicyError> {
-        self.files.policy()
+        let body = self
+            .run(Store::Policy, |client| read_unlocked(client, "policy"))?
+            .ok_or(StoreError::Uninitialized {
+                store: Store::Policy,
+            })?;
+        let policy: PolicyFile = serde_json::from_value(body)
+            .map_err(|error| PolicyError::Invalid(error.to_string()))?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    /// Refused until the store is initialized, so a policy alone never
+    /// stands in for an import that brings the mitigations too.
+    fn set_policy(&self, policy: &PolicyFile) -> Result<(), PolicyError> {
+        policy.validate()?;
+        let body = serde_json::to_value(policy)
+            .map_err(|error| PolicyError::Invalid(error.to_string()))?;
+        let written = self.run(Store::Policy, |client| {
+            let mut tx = client.transaction()?;
+            let written = write_document(&mut tx, "policy", &body)?;
+            tx.commit()?;
+            Ok(written)
+        })?;
+        match written {
+            true => Ok(()),
+            false => Err(StoreError::Uninitialized {
+                store: Store::Policy,
+            }
+            .into()),
+        }
     }
 
     /// One transaction that takes the trace's advisory lock and appends
@@ -412,19 +647,108 @@ impl StateBackend for Postgres {
     }
 
     fn mitigations(&self) -> Result<State, MitigationError> {
-        self.files.mitigations()
+        let body = self
+            .run(Store::Mitigations, |client| {
+                read_unlocked(client, "mitigations")
+            })?
+            .ok_or(StoreError::Uninitialized {
+                store: Store::Mitigations,
+            })?;
+        let state: State = serde_json::from_value(body)
+            .map_err(|error| MitigationError::Invalid(format!("stored mitigations: {error}")))?;
+        state.validate().map_err(MitigationError::Invalid)?;
+        Ok(state)
     }
 
+    /// Locks the mitigation row. Changes bump the generation and commit
+    /// with their audit events; a refusal commits only its event.
     fn edit_mitigations(
         &self,
         change: &mut dyn FnMut(&mut State) -> Result<Commit, MitigationError>,
     ) -> Result<(), MitigationError> {
-        self.files.edit_mitigations(change)
+        let invalid = |error: serde_json::Error| MitigationError::Invalid(error.to_string());
+        self.run(Store::Mitigations, |client| {
+            let mut tx = client.transaction()?;
+            let Some(body) = read_document(&mut tx, "mitigations", true)? else {
+                return Ok(Err(StoreError::Uninitialized {
+                    store: Store::Mitigations,
+                }
+                .into()));
+            };
+            let mut state: State = match serde_json::from_value(body) {
+                Ok(state) => state,
+                Err(error) => return Ok(Err(invalid(error))),
+            };
+            if let Err(reason) = state.validate() {
+                return Ok(Err(MitigationError::Invalid(reason)));
+            }
+            let events = match change(&mut state) {
+                Err(error) => return Ok(Err(error)),
+                Ok(Commit::Refusal(event)) => vec![*event],
+                Ok(Commit::Changes(events)) if events.is_empty() => return Ok(Ok(())),
+                Ok(Commit::Changes(events)) => {
+                    state.generation += 1;
+                    match serde_json::to_value(&state) {
+                        // The row is locked above, so it exists.
+                        Ok(body) => _ = write_document(&mut tx, "mitigations", &body)?,
+                        Err(error) => return Ok(Err(invalid(error))),
+                    }
+                    events
+                }
+            };
+            let rows: Result<Vec<_>, _> = events.iter().map(serde_json::to_value).collect();
+            match rows {
+                Ok(rows) => append_audit(&mut tx, Store::Mitigations, &rows)?,
+                Err(error) => return Ok(Err(invalid(error))),
+            }
+            tx.commit()?;
+            Ok(Ok(()))
+        })?
     }
 
-    /// The file stores as the directory backend probes them, and the
-    /// PostgreSQL stores over the pool's own connection path. Results are
-    /// reused for [`super::PROBE_TTL`].
+    /// One transaction writes the policy, registry and mitigation
+    /// documents, their audit records and the `initialized` marker, all
+    /// inserted: a store initialized before or meanwhile fails the insert,
+    /// so the import commits whole, once, or not at all.
+    fn import(&self, source: &Snapshot, operator: &str, now_ms: u64) -> Result<(), ImportError> {
+        let invalid = |error: serde_json::Error| {
+            ImportError::Mitigations(MitigationError::Invalid(error.to_string()))
+        };
+        let (state, record, events) = super::plan_import(source, operator, now_ms);
+        let policy = serde_json::to_value(&source.policy).map_err(invalid)?;
+        let registry = serde_json::to_value(&source.registry).map_err(invalid)?;
+        let state = serde_json::to_value(&state).map_err(invalid)?;
+        let record = serde_json::to_value(&record).map_err(invalid)?;
+        let events: Vec<_> = events
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(invalid)?;
+        let marker = serde_json::json!({
+            "operator": operator,
+            "at_unix_ms": now_ms,
+            "agents": source.policy.agents.len(),
+            "tools": source.registry.tools.len(),
+            "mitigations": source.mitigations.mitigations.len(),
+        });
+        self.run(Store::State, |client| {
+            let mut tx = client.transaction()?;
+            if read_document(&mut tx, "initialized", false)?.is_some() {
+                return Ok(Err(ImportError::AlreadyInitialized));
+            }
+            insert_document(&mut tx, "policy", &policy)?;
+            insert_document(&mut tx, "registry", &registry)?;
+            append_audit(&mut tx, Store::Registry, std::slice::from_ref(&record))?;
+            insert_document(&mut tx, "mitigations", &state)?;
+            append_audit(&mut tx, Store::Mitigations, &events)?;
+            insert_document(&mut tx, "initialized", &marker)?;
+            tx.commit()?;
+            Ok(Ok(()))
+        })?
+    }
+
+    /// Every store over the pool's own connection path
+    /// ([`Self::probe_now`]). Results are reused for [`super::PROBE_TTL`].
     fn probe(&self) -> Probe {
         self.probed.get(|| self.probe_now())
     }
