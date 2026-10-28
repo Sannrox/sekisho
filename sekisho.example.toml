@@ -54,6 +54,10 @@ max_call_ms = 60000
 # [limits.costs]
 # "ontology.search" = 2.0
 
+# [approvals]                         # approval gate for destructive and open-world tools
+# marked = ["records.delete"]         # need an approval route; refused without one
+# engine = ["records.delete"]         # the upstream parks and decides the call as an Action
+
 [guardrails]                          # runtime screening of tool traffic; defaults shown
 # inbound = "annotate"                # annotate | redact | block | allow (tool results)
 # outbound = "block"                  # block | redact | allow (tool arguments; secrets and personal data)

@@ -6,6 +6,7 @@
 //! tokens without reaching the issuer. Upstream MCP calls and per-call token
 //! exchange are separate, and only happen when those are configured.
 
+pub mod approvals;
 pub mod audit;
 pub mod config;
 pub mod diagnostics;
