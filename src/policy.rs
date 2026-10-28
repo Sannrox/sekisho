@@ -1,8 +1,10 @@
 //! Per-agent tool allowlists and grant ceilings.
 //!
-//! The policy file is read on every call, so an edit applies to the next
-//! call, and a file that cannot be read or parsed refuses every call (fail
-//! closed). An agent is the first actor in the token's `act` chain, or the
+//! The policy is read from the state backend on every call, so an edit
+//! applies to the next call, and a policy that cannot be read or parsed
+//! refuses every call (fail closed). The directory backend reads
+//! `[policy] file`; the PostgreSQL backend stores the policy that
+//! `sekisho policy import` wrote. An agent is the first actor in the token's `act` chain, or the
 //! subject when the token names no actor. An agent with no entry may call
 //! nothing.
 //!
@@ -41,11 +43,15 @@ pub struct PolicyFile {
 pub enum PolicyError {
     #[error("agent policy {path} cannot be loaded: {reason}")]
     Unavailable { path: PathBuf, reason: String },
+    #[error("agent policy is invalid: {0}")]
+    Invalid(String),
+    #[error("agent policy: {0}")]
+    Store(#[from] crate::state::StoreError),
 }
 
 impl PolicyFile {
-    /// Load and check for duplicate agents. A missing file is an error: an
-    /// absent policy must not mean "no restrictions".
+    /// Load and [`Self::validate`]. A missing file is an error: an absent
+    /// policy must not mean "no restrictions".
     pub fn load(path: &Path) -> Result<Self, PolicyError> {
         let unavailable = |reason: String| PolicyError::Unavailable {
             path: path.into(),
@@ -54,11 +60,21 @@ impl PolicyFile {
         let raw = std::fs::read_to_string(path).map_err(|error| unavailable(error.to_string()))?;
         let file: Self =
             toml::from_str(&raw).map_err(|error| unavailable(error.message().into()))?;
-        let mut ids = std::collections::BTreeSet::new();
-        if let Some(duplicate) = file.agents.iter().find(|agent| !ids.insert(&agent.id)) {
-            return Err(unavailable(format!("agent {} appears twice", duplicate.id)));
-        }
+        file.validate()
+            .map_err(|error| unavailable(error.to_string()))?;
         Ok(file)
+    }
+
+    /// Every agent appears once.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        let mut ids = std::collections::BTreeSet::new();
+        match self.agents.iter().find(|agent| !ids.insert(&agent.id)) {
+            Some(duplicate) => Err(PolicyError::Invalid(format!(
+                "agent {} appears twice",
+                duplicate.id
+            ))),
+            None => Ok(()),
+        }
     }
 
     pub fn agent(&self, id: &str) -> Option<&AgentPolicy> {

@@ -35,9 +35,11 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   disabled and is neither listed nor callable until an owner enables it. A
   changed description or schema becomes a pending version: agents keep the
   approved one until the owner approves, and `rollback` restores the previous
-  approved version. Upstream listings and the registry file are re-read
-  every `refresh_interval_ms`, so changes apply without a restart. Owner
-  edits are appended to the audit file.
+  approved version. Upstream listings are re-read every
+  `refresh_interval_ms` and the stored registry every second, so changes
+  apply without a restart. A replica that cannot load the registry for
+  5 s serves no tools until it can. Owner edits are appended to the audit
+  file.
   The optional `token_file` is used only to list tools; tool calls never
   carry it.
 - **Per-call token exchange.** For each tool call Sekisho exchanges the
@@ -76,8 +78,8 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   replicas need one host or a filesystem whose exclusive locks they all
   see. With a build that has the `postgres` cargo feature
   (`cargo build --release --features postgres`), `[state] backend =
-  "postgres"` keeps rate limits and the call audit in PostgreSQL, for
-  replicas on separate hosts; see PostgreSQL below. `GET /readyz` answers 200 when every store
+  "postgres"` keeps every store in PostgreSQL, for replicas on separate
+  hosts; see PostgreSQL below. `GET /readyz` answers 200 when every store
   can do work and 503 otherwise, with `{"backend", "ready", "stores"}`
   naming each store `ok` or `unavailable`; the reason goes to the log. A
   store is ready when its data parses and its write path works: a scratch
@@ -94,13 +96,14 @@ sekisho --config sekisho.toml diagnostics > bundle.json
 - **PostgreSQL.** `[state] backend = "postgres"` with `url_file`, a file
   holding the connection URL
   (`postgres://user:password@host:5432/sekisho?sslmode=require`), so the
-  password stays out of the config. It covers rate limits and the call
-  audit only; registry, policy and mitigations stay in their files until
-  #47, so in this interim configuration replicas still share those files.
-  Rate limits are always shared with this backend, `[cluster] state_dir`
-  or not.
+  password stays out of the config. It holds every store: rate limits,
+  call audit, registry, agent policy and mitigations, so `[cluster]
+  state_dir`, `[registry] file` and `audit_file`, `[policy] file`,
+  `[audit] calls_file` and `[mitigations]` paths are not used. Rate limits
+  are always shared with this backend.
   - *Schema.* Sekisho creates its tables (`sekisho_rate_buckets`,
-    `sekisho_call_audit`, `sekisho_schema_migrations`) on its first
+    `sekisho_call_audit`, `sekisho_state`, `sekisho_registry_audit`,
+    `sekisho_mitigation_audit`, `sekisho_schema_migrations`) on its first
     connection, in one transaction under an advisory lock, so replicas
     starting together are safe; a replica waits at most 3 s for another's
     migration (30 s per statement), then retries on its next use.
@@ -115,8 +118,34 @@ sekisho --config sekisho.toml diagnostics > bundle.json
     charge, at most 500 at a time and once a minute per replica.
   - *Call audit.* Each event is committed before the call answers, with
     `synchronous_commit` raised to `on` when the server default is `off`.
+  - *Registry, policy, mitigations.* Each is one JSON document. An edit
+    locks it, applies the same rules as the directory backend and commits
+    the change with its audit records (owner edits, mitigation events) in
+    one transaction, so concurrent edits from any replica serialize and a
+    change is never committed unaudited. Policy and mitigations are read
+    on every call, so a change applies to the next call on every replica.
+    Each replica reloads the registry every second, so an owner edit is
+    served everywhere within about 1 s (upstream listings still refresh
+    every `refresh_interval_ms`). A replica that has not loaded the
+    registry for 5 s serves no tools and `/readyz` reports `registry`
+    unavailable, on every backend: a snapshot it cannot confirm might
+    still serve a tool an owner disabled.
+  - *Initialization.* Registry, policy and mitigations do not exist in
+    the database until `sekisho state import --from <config>` (copy from
+    another backend) or `sekisho state init --operator <name>` (a new,
+    empty deployment) writes all three, their audit records and an
+    `initialized` marker in one transaction; either is refused once the
+    store is initialized. Until then every call is refused with `retry
+    after 1000 ms` and a message naming these commands, and `/readyz`
+    answers 503 with `"state": "uninitialized"`.
+  - *Policy.* `sekisho policy import agents.toml` validates a policy file
+    and replaces the stored policy in one transaction; `sekisho policy
+    export` prints it in the same format. It is refused on a store that is
+    not initialized, so a policy can never go live without the mitigations
+    an import brings. On the directory backend the same commands write and
+    read `[policy] file`.
   - *Outages.* While the database cannot be reached, calls fail closed
-    with `retry after 1000 ms` and `/readyz` reports `limits` and `audit`
+    with `retry after 1000 ms` and `/readyz` reports every store
     unavailable; connections come back on their own when it returns, with
     no restart. Readiness runs each store's write in a transaction it rolls
     back, on the same connections calls use. Waits are bounded: a free
@@ -133,12 +162,20 @@ sekisho --config sekisho.toml diagnostics > bundle.json
     whether TLS is used; when it is, the server certificate and host name
     are always verified against the system roots (`SSL_CERT_FILE` adds
     one).
-  - *Switching.* Moving from the directory backend is a deliberate
-    switch, not a rolling change: replicas on different backends do not
-    share buckets or audit, so stop or drain the directory replicas
-    before the PostgreSQL ones take traffic. Existing `limits.json` and
-    `calls.jsonl` are not imported; buckets start full and old audit
-    events stay in the file.
+  - *Switching.* Moving from the directory backend, or upgrading a
+    PostgreSQL deployment of the previous release (which kept registry,
+    policy and mitigations in files), is a deliberate switch, not a rolling
+    change: old and new replicas consult different authorities. Drain or
+    stop the old replicas, run `sekisho --config postgres.toml state import
+    --from old.toml --operator <name>`, where `old.toml` selects the
+    directory backend over the files the old replicas used (for a previous
+    PostgreSQL deployment, its config without the `[state]` section), then
+    start the new ones. The import copies the
+    agent policy, the registry (owner enablement and approved versions) and
+    active mitigations, each audited as an import, in one transaction, so a
+    failed import changes nothing and can be retried. Rate-limit buckets
+    and audit logs are not copied: buckets start full and old audit events
+    stay where they were.
 - **Approval gate.** Tools listed in `[approvals] marked` (destructive or
   open-world, by registry key) are forwarded only along an approval route. A
   marked tool also listed in `engine` goes to an upstream that parks and
@@ -226,9 +263,10 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   and grant ceiling (see `agents.example.toml`). The agent is the token's
   outermost `act` actor, or the subject when there is none. Agents see and
   call only allowed tools; other calls are refused before forwarding and
-  audited. The file is read on every call, so an
-  edit applies to the next one. A missing or unreadable file refuses every
-  call. Engines enforce the user's grants intersected with the ceiling
+  audited. The policy is read on every call, so an
+  edit applies to the next one. A missing or unreadable policy refuses
+  every call. `sekisho policy import <file>` and `export` replace and print
+  it on either backend. Engines enforce the user's grants intersected with the ceiling
   through the delegated token from per-call token exchange.
 - **Verifier.** `jwks` checks asymmetric JWTs (RS, PS, ES, EdDSA; never
   shared-secret HS) against a local JWKS file: `kid`, signature, issuer,

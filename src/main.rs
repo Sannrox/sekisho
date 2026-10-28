@@ -1,6 +1,8 @@
 //! `sekisho serve` runs the gateway; `sekisho registry` edits the tool
 //! registry; `sekisho mitigation` applies and lifts mitigations;
-//! `sekisho diagnostics` prints a support bundle.
+//! `sekisho policy` imports and exports the agent policy; `sekisho state
+//! import` copies state between backends; `sekisho diagnostics` prints a
+//! support bundle.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,6 +47,47 @@ enum Command {
     Mitigation {
         #[command(subcommand)]
         command: MitigationCommand,
+    },
+    /// Read or replace the agent policy in the state backend.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    /// Copy state between backends.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Print the stored policy as TOML (the `agents.toml` format).
+    Export,
+    /// Validate a policy file and replace the stored policy with it. The
+    /// next call on every replica uses it.
+    Import { file: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum StateCommand {
+    /// Copy policy, registry and mitigations from the backend another
+    /// config selects (for example the directory backend being replaced)
+    /// into this config's backend. Audit logs stay where they are.
+    Import {
+        /// Config whose backend holds the state to copy.
+        #[arg(long)]
+        from: PathBuf,
+        /// Recorded as the owner and operator of the imported state.
+        #[arg(long)]
+        operator: String,
+    },
+    /// Initialize an empty PostgreSQL store for a new deployment: no
+    /// agents, tools or mitigations. Import a policy next.
+    Init {
+        /// Recorded as the operator who initialized the store.
+        #[arg(long)]
+        operator: String,
     },
 }
 
@@ -134,9 +177,51 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&bundle)?);
             Ok(())
         }
-        Command::Registry { command } => registry_command(&config, command),
-        Command::Mitigation { command } => mitigation_command(&config, command),
+        // Store commands block; a PostgreSQL client must not run on an
+        // async worker.
+        command => {
+            tokio::task::spawn_blocking(move || match command {
+                Command::Registry { command } => registry_command(&config, command),
+                Command::Mitigation { command } => mitigation_command(&config, command),
+                Command::Policy { command } => policy_command(&config, command),
+                Command::State { command } => state_command(&config, command),
+                Command::Serve | Command::Diagnostics => unreachable!("handled above"),
+            })
+            .await?
+        }
     }
+}
+
+fn policy_command(config: &Config, command: PolicyCommand) -> Result<()> {
+    let store = sekisho::state::open(config)?;
+    match command {
+        PolicyCommand::Export => print!("{}", toml::to_string(&store.policy()?)?),
+        PolicyCommand::Import { file } => {
+            let policy = sekisho::policy::PolicyFile::load(&file)?;
+            store.set_policy(&policy)?;
+            println!("imported {} agents", policy.agents.len());
+        }
+    }
+    Ok(())
+}
+
+fn state_command(config: &Config, command: StateCommand) -> Result<()> {
+    let target = sekisho::state::open(config)?;
+    match command {
+        StateCommand::Import { from, operator } => {
+            let source = sekisho::state::open(&Config::load(&from)?)?;
+            let imported = sekisho::state::import(source.as_ref(), target.as_ref(), &operator)?;
+            println!(
+                "imported {} agents, {} tools, {} mitigations",
+                imported.agents, imported.tools, imported.mitigations
+            );
+        }
+        StateCommand::Init { operator } => {
+            sekisho::state::init(target.as_ref(), &operator)?;
+            println!("initialized; import a policy with `sekisho policy import <file>`");
+        }
+    }
+    Ok(())
 }
 
 fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()> {

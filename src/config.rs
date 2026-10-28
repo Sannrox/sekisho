@@ -65,7 +65,8 @@ pub struct RegistryConfig {
     pub file: PathBuf,
     /// Owner edits, one JSON line each.
     pub audit_file: PathBuf,
-    /// How often upstream listings and the registry file are re-read.
+    /// How often upstream listings are re-read and merged into the registry;
+    /// the stored registry itself is reloaded every second.
     pub refresh_interval_ms: u64,
 }
 
@@ -133,9 +134,8 @@ pub enum StateConfig {
     /// `[mitigations]` paths.
     #[default]
     Directory,
-    /// PostgreSQL for rate limits and call audit; registry, policy and
-    /// mitigations stay on the directory backend until #47. Needs a build
-    /// with the `postgres` feature.
+    /// PostgreSQL for every store: rate limits, call audit, registry,
+    /// policy and mitigations. Needs a build with the `postgres` feature.
     Postgres {
         /// File holding the connection URL (`postgres://…?sslmode=require`),
         /// so credentials stay out of the config.

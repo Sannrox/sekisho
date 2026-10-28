@@ -38,6 +38,8 @@ pub enum RegistryError {
     UnknownTool(String),
     #[error("{0}")]
     Invalid(String),
+    #[error("registry: {0}")]
+    Store(#[from] crate::state::StoreError),
 }
 
 /// What an upstream lists for one tool, as the registry versions it.
