@@ -37,15 +37,16 @@ async fn start() -> Running {
         metrics: Default::default(),
     });
     let shutdown = CancellationToken::new();
+    let store = sekisho::state::open(&config);
     let federation = Arc::new(sekisho::gateway::Federation::new(
         Vec::new(),
-        config.registry.file.clone(),
+        Arc::clone(&store),
     ));
     let gateway = sekisho::gateway::Gateway::new(
         federation,
-        config.policy.clone(),
+        Arc::clone(&store),
         sekisho::exchange::Exchanger::new(None),
-        sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+        sekisho::audit::CallAudit::new(store),
         Default::default(),
     );
     let app = router(state, &config.mcp, gateway, shutdown.clone());
@@ -209,15 +210,16 @@ async fn configured_browser_origins_pass_cors_preflight() {
         metrics: Default::default(),
     });
     let shutdown = CancellationToken::new();
+    let store = sekisho::state::open(&config);
     let federation = Arc::new(sekisho::gateway::Federation::new(
         Vec::new(),
-        config.registry.file.clone(),
+        Arc::clone(&store),
     ));
     let gateway = sekisho::gateway::Gateway::new(
         federation,
-        config.policy.clone(),
+        Arc::clone(&store),
         sekisho::exchange::Exchanger::new(None),
-        sekisho::audit::CallAudit::new(config.audit.calls_file.clone()),
+        sekisho::audit::CallAudit::new(store),
         Default::default(),
     );
     let app = router(state, &config.mcp, gateway, shutdown.clone());

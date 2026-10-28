@@ -1,6 +1,10 @@
 //! Mitigations (#42): disable a tool or a whole upstream for a scope, or deny
 //! an outbound destination, as a tracked change tied to a decision reference.
 //!
+//! [`MitigationStore`] keeps them in the state backend ([`crate::state`]).
+//! The rest of these notes describe the directory backend
+//! ([`MitigationFiles`]).
+//!
 //! The store is one JSON file shared by every replica (`[mitigations] file`,
 //! by default in `[cluster] state_dir`). Like the rate-limit buckets it needs
 //! a filesystem whose exclusive locks every replica sees.
@@ -40,9 +44,12 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+
+use crate::state::StateBackend;
 
 /// Where the mitigation store and its audit live. Every replica must reach
 /// the same files. An explicit path resolves against the config file's
@@ -352,75 +359,31 @@ impl MitigationEvent {
     }
 }
 
-/// The shared mitigation file and its audit.
-#[derive(Debug, Clone)]
-pub struct MitigationStore {
-    file: PathBuf,
-    audit_file: PathBuf,
-    /// Test hook: fail as if the process died just before this step of a commit.
-    #[cfg(test)]
-    crash: Option<Crash>,
-    /// Test hook: directories fsynced for the audit log.
-    #[cfg(test)]
-    synced_dirs: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+/// What one locked edit of the mitigation state commits.
+pub enum Commit {
+    /// The state as changed, with the events that audit it. No events
+    /// means nothing changed and nothing is written.
+    Changes(Vec<MitigationEvent>),
+    /// A refused decision: audited, and the state is left as it was.
+    Refusal(Box<MitigationEvent>),
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Crash {
-    Rename,
-    Append,
-    Clear,
+/// Mitigations in the state backend ([`crate::state`]), shared by every
+/// replica.
+#[derive(Clone)]
+pub struct MitigationStore {
+    store: Arc<dyn StateBackend>,
 }
 
 impl MitigationStore {
-    pub fn new(config: &MitigationsConfig) -> Self {
-        Self {
-            file: config.file.clone().unwrap_or_else(|| FILE.into()),
-            audit_file: config
-                .audit_file
-                .clone()
-                .unwrap_or_else(|| AUDIT_FILE.into()),
-            #[cfg(test)]
-            crash: None,
-            #[cfg(test)]
-            synced_dirs: Default::default(),
-        }
+    pub fn new(store: Arc<dyn StateBackend>) -> Self {
+        Self { store }
     }
 
-    #[cfg(test)]
-    fn crash_at(&self, at: Crash) -> Result<(), MitigationError> {
-        match self.crash == Some(at) {
-            true => Err(self.error(format!("injected crash {at:?}"))),
-            false => Ok(()),
-        }
-    }
-
-    fn error(&self, reason: impl std::fmt::Display) -> MitigationError {
-        MitigationError::Store {
-            path: self.file.clone(),
-            reason: reason.to_string(),
-        }
-    }
-
-    /// The current state, without locking (writers replace the file by
-    /// rename). Any stored entry that does not validate, such as a
-    /// destination that is not normalized, makes the whole store unreadable.
+    /// The current state. Any stored entry that does not validate makes the
+    /// whole store unreadable.
     pub fn load(&self) -> Result<State, MitigationError> {
-        let state: State = match std::fs::read(&self.file) {
-            Ok(raw) => serde_json::from_slice(&raw).map_err(|error| self.error(error))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
-            Err(error) => return Err(self.error(error)),
-        };
-        for (id, mitigation) in &state.mitigations {
-            mitigation
-                .validate()
-                .map_err(|reason| self.error(format!("entry {id}: {reason}")))?;
-            if mitigation.id() != *id {
-                return Err(self.error(format!("entry {id} is stored under the wrong id")));
-            }
-        }
-        Ok(state)
+        self.store.mitigations()
     }
 
     /// The active mitigation that refuses `call`, if any. Expired entries do
@@ -494,9 +457,11 @@ impl MitigationStore {
             event.operator = Some(mitigation.operator.clone());
             return Err(self.refuse(event, reason));
         }
-        self.edit(|state| {
+        let mut outcome = Outcome::Unchanged;
+        self.store.edit_mitigations(&mut |state| {
             if state.mitigations.get(&id).is_some_and(|m| m.active(now_ms)) {
-                return Ok((Vec::new(), Outcome::Unchanged));
+                outcome = Outcome::Unchanged;
+                return Ok(Commit::Changes(Vec::new()));
             }
             let mut event = MitigationEvent::new(
                 Action::Apply,
@@ -506,10 +471,11 @@ impl MitigationStore {
                 now_ms,
             );
             event.operator = Some(mitigation.operator.clone());
-            state.mitigations.insert(id.clone(), mitigation);
-            Ok((vec![event], Outcome::Applied))
-        })
-        .map(|outcome| (id, outcome))
+            state.mitigations.insert(id.clone(), mitigation.clone());
+            outcome = Outcome::Applied;
+            Ok(Commit::Changes(vec![event]))
+        })?;
+        Ok((id, outcome))
     }
 
     /// Lift mitigation `id` once `verifier` accepts `decision`. Lifting one
@@ -524,9 +490,11 @@ impl MitigationStore {
     ) -> Result<Outcome, MitigationError> {
         // The entry is read, verified and removed under one lock, so another
         // replica cannot swap it between the check and the removal.
-        self.edit(|state| {
+        let (mut outcome, mut refused) = (Outcome::Unchanged, None);
+        let edited = self.store.edit_mitigations(&mut |state| {
+            (outcome, refused) = (Outcome::Unchanged, None);
             let Some(mitigation) = state.mitigations.remove(id) else {
-                return Ok((Vec::new(), Outcome::Unchanged));
+                return Ok(Commit::Changes(Vec::new()));
             };
             let check = DecisionCheck {
                 change: Change::Lift,
@@ -538,19 +506,29 @@ impl MitigationStore {
                 let mut event = MitigationEvent::new(Action::Refuse, id, &mitigation, 0, now_ms);
                 event.lift_decision = Some(decision.into());
                 event.operator = Some(operator.into());
-                return Err(self.refuse_locked(event, reason));
+                let event = refusal(event, &reason);
+                refused = Some(reason);
+                return Ok(Commit::Refusal(Box::new(event)));
             }
             let mut event =
                 MitigationEvent::new(Action::Lift, id, &mitigation, state.generation + 1, now_ms);
             event.lift_decision = Some(decision.into());
             event.operator = Some(operator.into());
-            Ok((vec![event], Outcome::Lifted))
-        })
+            outcome = Outcome::Lifted;
+            Ok(Commit::Changes(vec![event]))
+        });
+        if let Some(reason) = refused {
+            if let Err(error) = edited {
+                eprintln!("auditing a refused mitigation decision failed: {error}");
+            }
+            return Err(MitigationError::Refused(reason));
+        }
+        edited.map(|()| outcome)
     }
 
     /// Remove and audit every mitigation expired at `now_ms`.
     pub fn expire(&self, now_ms: u64) -> Result<(), MitigationError> {
-        self.edit(|state| {
+        self.store.edit_mitigations(&mut |state| {
             let generation = state.generation + 1;
             let expired: Vec<String> = state
                 .mitigations
@@ -563,36 +541,100 @@ impl MitigationStore {
                 .filter_map(|id| state.mitigations.remove(id).map(|m| (id, m)))
                 .map(|(id, m)| MitigationEvent::new(Action::Expire, id, &m, generation, now_ms))
                 .collect();
-            Ok((events, ()))
+            Ok(Commit::Changes(events))
         })
     }
 
     /// Audit a refused decision; the store is not touched.
     fn refuse(&self, event: MitigationEvent, reason: String) -> MitigationError {
-        let locked = self.locked().and_then(|lock| {
-            // Flush first, so a refusal never lands between a pending
-            // batch's `audit_offset` and the batch itself.
-            let mut state = self.load()?;
-            self.flush(&mut state)?;
-            Ok(lock)
-        });
-        match locked {
-            Ok(_lock) => self.refuse_locked(event, reason),
-            Err(error) => {
-                eprintln!("auditing a refused mitigation decision failed: {error}");
-                MitigationError::Refused(reason)
-            }
-        }
-    }
-
-    /// [`Self::refuse`] with the store lock held and the outbox flushed.
-    fn refuse_locked(&self, mut event: MitigationEvent, reason: String) -> MitigationError {
-        event.event_id = format!("refuse:{}", uuid::Uuid::new_v4().simple());
-        event.reason = Some(reason.clone());
-        if let Err(error) = self.append(std::slice::from_ref(&event)) {
+        let event = refusal(event, &reason);
+        if let Err(error) = self
+            .store
+            .edit_mitigations(&mut |_| Ok(Commit::Refusal(Box::new(event.clone()))))
+        {
             eprintln!("auditing a refused mitigation decision failed: {error}");
         }
         MitigationError::Refused(reason)
+    }
+}
+
+/// `event` as a refusal audit line: its own random id and the reason.
+fn refusal(mut event: MitigationEvent, reason: &str) -> MitigationEvent {
+    event.event_id = format!("refuse:{}", uuid::Uuid::new_v4().simple());
+    event.reason = Some(reason.into());
+    event
+}
+
+/// The directory backend's mitigation store: the shared JSON file, its
+/// audit log, and the outbox between them (see the module docs).
+#[derive(Debug, Clone)]
+pub(crate) struct MitigationFiles {
+    file: PathBuf,
+    pub(crate) audit_file: PathBuf,
+    /// Test hook: fail as if the process died just before this step of a commit.
+    #[cfg(test)]
+    crash: Option<Crash>,
+    /// Test hook: directories fsynced for the audit log.
+    #[cfg(test)]
+    pub(crate) synced_dirs: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Crash {
+    Rename,
+    Append,
+    Clear,
+}
+
+impl MitigationFiles {
+    pub(crate) fn new(config: &MitigationsConfig) -> Self {
+        Self {
+            file: config.file.clone().unwrap_or_else(|| FILE.into()),
+            audit_file: config
+                .audit_file
+                .clone()
+                .unwrap_or_else(|| AUDIT_FILE.into()),
+            #[cfg(test)]
+            crash: None,
+            #[cfg(test)]
+            synced_dirs: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn crash_at(&self, at: Crash) -> Result<(), MitigationError> {
+        match self.crash == Some(at) {
+            true => Err(self.error(format!("injected crash {at:?}"))),
+            false => Ok(()),
+        }
+    }
+
+    fn error(&self, reason: impl std::fmt::Display) -> MitigationError {
+        MitigationError::Store {
+            path: self.file.clone(),
+            reason: reason.to_string(),
+        }
+    }
+
+    /// The current state, without locking (writers replace the file by
+    /// rename). Any stored entry that does not validate, such as a
+    /// destination that is not normalized, makes the whole store unreadable.
+    pub(crate) fn load(&self) -> Result<State, MitigationError> {
+        let state: State = match std::fs::read(&self.file) {
+            Ok(raw) => serde_json::from_slice(&raw).map_err(|error| self.error(error))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
+            Err(error) => return Err(self.error(error)),
+        };
+        for (id, mitigation) in &state.mitigations {
+            mitigation
+                .validate()
+                .map_err(|reason| self.error(format!("entry {id}: {reason}")))?;
+            if mitigation.id() != *id {
+                return Err(self.error(format!("entry {id} is stored under the wrong id")));
+            }
+        }
+        Ok(state)
     }
 
     fn locked(&self) -> Result<File, MitigationError> {
@@ -607,6 +649,53 @@ impl MitigationStore {
             .map_err(|error| self.error(error))?;
         lock.lock().map_err(|error| self.error(error))?;
         Ok(lock)
+    }
+
+    /// Whether [`Self::edit`] could run: under the store lock, the state
+    /// parses, a scratch file can be written and renamed next to it, and the
+    /// audit log opens as [`Self::open_log`] opens it.
+    pub(crate) fn probe(&self) -> Result<(), MitigationError> {
+        // `locked` creates the store's directory; the audit log's must exist
+        // unless it is that same directory.
+        let parent = crate::state::Parent::Created;
+        let audit_parent = if self.audit_file.parent() == self.file.parent() {
+            parent
+        } else {
+            crate::state::Parent::MustExist
+        };
+        let _lock = crate::state::probe_lock(&self.file.with_extension("lock"), false, parent)
+            .map_err(|error| self.error(error))?;
+        let state = self.load()?;
+        // A pending outbox must still fit the log, as `flush` requires; a
+        // missing log is created empty by `flush`.
+        if !state.pending_audit.is_empty() {
+            let len = match std::fs::metadata(&self.audit_file) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(self.audit_error(error)),
+            };
+            self.outbox_offset(&state, len)?;
+        }
+        crate::state::probe_writable(&self.file, parent).map_err(|error| self.error(error))?;
+        crate::state::probe_append(&self.audit_file, true, audit_parent)
+            .map_err(|error| self.audit_error(error))
+    }
+
+    /// Where a pending outbox is appended, given the audit log's length:
+    /// its `audit_offset`, which the log must reach. A log shorter than the
+    /// offset was truncated or replaced outside Sekisho; that fails visibly
+    /// instead of guessing. Only meaningful while events are pending.
+    fn outbox_offset(&self, state: &State, len: u64) -> Result<u64, MitigationError> {
+        let offset = state
+            .audit_offset
+            .ok_or_else(|| self.error("pending audit events without an audit offset"))?;
+        if len < offset {
+            return Err(self.audit_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit log is {len} bytes, shorter than its recorded {offset}"),
+            )));
+        }
+        Ok(offset)
     }
 
     fn audit_error(&self, error: std::io::Error) -> MitigationError {
@@ -713,9 +802,6 @@ impl MitigationStore {
         if state.pending_audit.is_empty() {
             return Ok(());
         }
-        let offset = state
-            .audit_offset
-            .ok_or_else(|| self.error("pending audit events without an audit offset"))?;
         #[cfg(test)]
         self.crash_at(Crash::Append)?;
         let mut log = OpenOptions::new()
@@ -727,12 +813,7 @@ impl MitigationStore {
             .metadata()
             .map_err(|error| self.audit_error(error))?
             .len();
-        if len < offset {
-            return Err(self.audit_error(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("audit log is {len} bytes, shorter than its recorded {offset}"),
-            )));
-        }
+        let offset = self.outbox_offset(state, len)?;
         if len > offset {
             log.set_len(offset)
                 .and_then(|()| log.sync_all())
@@ -748,21 +829,23 @@ impl MitigationStore {
     }
 
     /// Load, change and replace the store under its lock, first flushing an
-    /// outbox left by a crash. `change` returns the events to audit; none
-    /// means nothing changed and nothing is written. The new state and its
-    /// events commit in one rename; appending them afterwards is retried by
-    /// the next write if it fails, so the change still succeeds.
-    fn edit<T>(
+    /// outbox left by a crash, so a refusal never lands between a pending
+    /// batch's `audit_offset` and the batch itself. A refusal is appended to
+    /// the log and the state is not written. Changes and their events commit
+    /// in one rename; appending them afterwards is retried by the next write
+    /// if it fails, so the change still succeeds.
+    pub(crate) fn edit(
         &self,
-        change: impl FnOnce(&mut State) -> Result<(Vec<MitigationEvent>, T), MitigationError>,
-    ) -> Result<T, MitigationError> {
+        change: &mut dyn FnMut(&mut State) -> Result<Commit, MitigationError>,
+    ) -> Result<(), MitigationError> {
         let _lock = self.locked()?;
         let mut state = self.load()?;
         self.flush(&mut state)?;
-        let (events, value) = change(&mut state)?;
-        if events.is_empty() {
-            return Ok(value);
-        }
+        let events = match change(&mut state)? {
+            Commit::Refusal(event) => return self.append(std::slice::from_ref(&*event)),
+            Commit::Changes(events) if events.is_empty() => return Ok(()),
+            Commit::Changes(events) => events,
+        };
         let log = self.open_log()?;
         let offset = log
             .metadata()
@@ -777,11 +860,7 @@ impl MitigationStore {
         if let Err(error) = self.flush(&mut state) {
             eprintln!("mitigation audit pending, retried on the next write: {error}");
         }
-        Ok(value)
-    }
-
-    pub fn audit_file(&self) -> &Path {
-        &self.audit_file
+        Ok(())
     }
 }
 
@@ -824,15 +903,29 @@ mod tests {
         }
     }
 
-    fn store(dir: &tempfile::TempDir) -> MitigationStore {
-        MitigationStore::new(&MitigationsConfig {
-            file: Some(dir.path().join("mitigations.json")),
-            audit_file: Some(dir.path().join("mitigations-audit.jsonl")),
-        })
+    /// The directory backend's mitigation files in `dir`.
+    fn files(dir: &tempfile::TempDir) -> MitigationFiles {
+        crate::state::Directory::in_dir(dir.path()).mitigations
     }
 
-    fn events(store: &MitigationStore) -> Vec<MitigationEvent> {
-        std::fs::read_to_string(store.audit_file())
+    /// A store over the directory backend in `dir`, with `files` for its
+    /// mitigations.
+    fn store_on(dir: &tempfile::TempDir, files: MitigationFiles) -> MitigationStore {
+        let mut backend = crate::state::Directory::in_dir(dir.path());
+        backend.mitigations = files;
+        MitigationStore::new(Arc::new(backend))
+    }
+
+    fn store(dir: &tempfile::TempDir) -> MitigationStore {
+        store_on(dir, files(dir))
+    }
+
+    fn events(dir: &tempfile::TempDir) -> Vec<MitigationEvent> {
+        read_events(&files(dir).audit_file)
+    }
+
+    fn read_events(audit_file: &Path) -> Vec<MitigationEvent> {
+        std::fs::read_to_string(audit_file)
             .unwrap_or_default()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
@@ -880,7 +973,7 @@ mod tests {
         let lift = |at| store.lift(&Standalone, &id, "DEC-2", "ops-1", at).unwrap();
         assert_eq!(lift(30), Outcome::Lifted);
         assert_eq!(lift(40), Outcome::Unchanged);
-        let audit = events(&store);
+        let audit = events(&dir);
         let actions: Vec<Action> = audit.iter().map(|e| e.action).collect();
         assert_eq!(actions, [Action::Apply, Action::Lift]);
         assert_eq!(audit[1].decision, "DEC-1");
@@ -889,14 +982,17 @@ mod tests {
     }
 
     fn crashing(dir: &tempfile::TempDir, at: Crash) -> MitigationStore {
-        MitigationStore {
-            crash: Some(at),
-            ..store(dir)
-        }
+        store_on(
+            dir,
+            MitigationFiles {
+                crash: Some(at),
+                ..files(dir)
+            },
+        )
     }
 
-    fn actions(store: &MitigationStore) -> Vec<Action> {
-        events(store).iter().map(|e| e.action).collect()
+    fn actions(dir: &tempfile::TempDir) -> Vec<Action> {
+        events(dir).iter().map(|e| e.action).collect()
     }
 
     #[test]
@@ -910,7 +1006,7 @@ mod tests {
         );
         let store = store(&dir);
         assert_eq!(store.load().unwrap(), State::default());
-        assert!(actions(&store).is_empty());
+        assert!(actions(&dir).is_empty());
     }
 
     #[test]
@@ -921,13 +1017,49 @@ mod tests {
             .apply(&Standalone, disable("tools.a", Scope::All, None), 10)
             .unwrap();
         let store = store(&dir);
-        assert!(actions(&store).is_empty());
+        assert!(actions(&dir).is_empty());
         assert_eq!(store.load().unwrap().pending_audit.len(), 1);
         store
             .apply(&Standalone, disable("tools.b", Scope::All, None), 20)
             .unwrap();
-        assert_eq!(actions(&store), [Action::Apply, Action::Apply]);
+        assert_eq!(actions(&dir), [Action::Apply, Action::Apply]);
         assert!(store.load().unwrap().pending_audit.is_empty());
+    }
+
+    #[test]
+    fn a_pending_outbox_over_a_truncated_log_fails_the_probe_until_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store
+            .apply(&Standalone, disable("tools.a", Scope::All, None), 10)
+            .unwrap();
+        // The next commit stays in the outbox, past the first apply's line.
+        crashing(&dir, Crash::Append)
+            .apply(&Standalone, disable("tools.b", Scope::All, None), 20)
+            .unwrap();
+        let log = files(&dir).audit_file;
+        let saved = std::fs::read(&log).unwrap();
+        std::fs::write(&log, b"").unwrap();
+        let before = std::fs::read(dir.path().join("mitigations.json")).unwrap();
+        assert!(files(&dir).probe().is_err());
+        assert_eq!(
+            std::fs::read(dir.path().join("mitigations.json")).unwrap(),
+            before,
+            "the probe modifies nothing"
+        );
+        assert!(std::fs::read(&log).unwrap().is_empty());
+        assert!(
+            store
+                .apply(&Standalone, disable("tools.c", Scope::All, None), 30)
+                .is_err(),
+            "edits fail as before"
+        );
+        std::fs::write(&log, saved).unwrap();
+        files(&dir).probe().unwrap();
+        store
+            .apply(&Standalone, disable("tools.c", Scope::All, None), 30)
+            .unwrap();
+        assert_eq!(actions(&dir), [Action::Apply, Action::Apply, Action::Apply]);
     }
 
     #[test]
@@ -937,12 +1069,12 @@ mod tests {
             .apply(&Standalone, disable("tools.a", Scope::All, None), 10)
             .unwrap();
         let store = store(&dir);
-        assert_eq!(actions(&store), [Action::Apply]);
+        assert_eq!(actions(&dir), [Action::Apply]);
         assert_eq!(store.load().unwrap().pending_audit.len(), 1);
         store
             .apply(&Standalone, disable("tools.b", Scope::All, None), 20)
             .unwrap();
-        let ids: Vec<String> = events(&store).into_iter().map(|e| e.event_id).collect();
+        let ids: Vec<String> = events(&dir).into_iter().map(|e| e.event_id).collect();
         assert_eq!(ids.len(), 2, "{ids:?}");
         assert_ne!(ids[0], ids[1]);
     }
@@ -963,13 +1095,16 @@ mod tests {
             event.reason = Some("x".repeat(600 * 1024));
             event
         };
-        crashed.edit(|_| Ok((vec![big(1), big(2)], ()))).unwrap();
+        crashed
+            .store
+            .edit_mitigations(&mut |_| Ok(Commit::Changes(vec![big(1), big(2)])))
+            .unwrap();
         let store = store(&dir);
         assert_eq!(store.load().unwrap().pending_audit.len(), 2);
         store
             .apply(&Standalone, disable("tools.b", Scope::All, None), 20)
             .unwrap();
-        let ids: Vec<String> = events(&store).into_iter().map(|e| e.event_id).collect();
+        let ids: Vec<String> = events(&dir).into_iter().map(|e| e.event_id).collect();
         assert_eq!(ids.len(), 3, "{ids:?}");
         assert_eq!(&ids[..2], ["apply:m1:1", "apply:m2:2"]);
         let state = store.load().unwrap();
@@ -981,15 +1116,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let audit_dir = dir.path().join("audit");
         std::fs::create_dir(&audit_dir).unwrap();
-        let store = MitigationStore {
+        let files = MitigationFiles {
             audit_file: audit_dir.join("mitigations-audit.jsonl"),
-            ..store(&dir)
+            ..files(&dir)
         };
+        let synced_dirs = Arc::clone(&files.synced_dirs);
+        let audit_file = files.audit_file.clone();
+        let store = store_on(&dir, files);
         store
             .apply(&Standalone, disable("tools.a", Scope::All, None), 10)
             .unwrap();
-        assert_eq!(actions(&store), [Action::Apply]);
-        let synced = store.synced_dirs.lock().unwrap().clone();
+        let actions: Vec<Action> = read_events(&audit_file).iter().map(|e| e.action).collect();
+        assert_eq!(actions, [Action::Apply]);
+        let synced = synced_dirs.lock().unwrap().clone();
         assert!(synced.contains(&audit_dir), "{synced:?}");
     }
 
@@ -1002,14 +1141,14 @@ mod tests {
             .unwrap();
         let mut log = OpenOptions::new()
             .append(true)
-            .open(store.audit_file())
+            .open(files(&dir).audit_file)
             .unwrap();
         log.write_all(b"{\"event_id\":\"apply:torn").unwrap();
         store
             .apply(&Standalone, disable("tools.b", Scope::All, None), 20)
             .unwrap();
         // Every line parses: the first apply, then the second, nothing torn.
-        let tools: Vec<Target> = events(&store).into_iter().map(|e| e.target).collect();
+        let tools: Vec<Target> = events(&dir).into_iter().map(|e| e.target).collect();
         assert_eq!(
             tools,
             [
@@ -1070,7 +1209,7 @@ mod tests {
         };
         store.lift(&racing, &id, "DEC-2", "ops-1", 200).unwrap();
         let inspected = racing.inspected.into_inner().unwrap();
-        let lifted = events(&store)
+        let lifted = events(&dir)
             .into_iter()
             .rfind(|e| e.action == Action::Lift)
             .unwrap();
@@ -1104,7 +1243,7 @@ mod tests {
         let before = store.load().unwrap();
         assert!(store.lift(&Rejecting, &id, "DEC-2", "ops-1", 20).is_err());
         assert_eq!(store.load().unwrap(), before);
-        let refused: Vec<_> = events(&store)
+        let refused: Vec<_> = events(&dir)
             .into_iter()
             .filter(|e| e.action == Action::Refuse)
             .collect();
@@ -1187,13 +1326,10 @@ mod tests {
             .unwrap();
         let echo = call("tools.echo", "agent-7");
         assert!(store.check(&echo, 99).unwrap().is_some());
-        let second = MitigationStore::new(&MitigationsConfig {
-            file: Some(dir.path().join("mitigations.json")),
-            audit_file: Some(dir.path().join("mitigations-audit.jsonl")),
-        });
+        let second = self::store(&dir);
         assert!(store.check(&echo, 100).unwrap().is_none());
         assert!(second.check(&echo, 101).unwrap().is_none());
-        let expired = events(&store)
+        let expired = events(&dir)
             .into_iter()
             .filter(|e| e.action == Action::Expire)
             .count();

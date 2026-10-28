@@ -7,17 +7,22 @@
 //! the wait until all of them could. Tenant limits apply when the token
 //! carries a `tenant_id`. Defaults are generous so interactive use is not
 //! throttled.
+//!
+//! Buckets live in this process, or with `[cluster] state_dir` in the state
+//! backend ([`crate::state`]) so replicas share them.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
+
+use crate::state::{Bucket as SharedBucket, StateBackend};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,8 +148,8 @@ const TABLE_LIMIT: usize = 100_000;
 pub struct Limiter {
     config: LimitsConfig,
     buckets: Mutex<Buckets>,
-    /// Shared replica file. Process death releases the flock.
-    store: Option<PathBuf>,
+    /// Shared buckets; in-process ones when unset.
+    store: Option<Arc<dyn StateBackend>>,
 }
 
 #[derive(Default)]
@@ -172,19 +177,20 @@ impl Limiter {
         }
     }
 
-    /// Rate-limit buckets in `path`, shared by replicas.
-    pub fn shared(config: LimitsConfig, path: impl Into<PathBuf>) -> Self {
+    /// Rate-limit buckets in `store`, shared by replicas.
+    pub fn shared(config: LimitsConfig, store: Arc<dyn StateBackend>) -> Self {
         Self {
             config,
             buckets: Mutex::default(),
-            store: Some(path.into()),
+            store: Some(store),
         }
     }
 
-    pub fn from_config(limits: LimitsConfig, state_dir: Option<&Path>) -> Self {
-        match state_dir {
-            Some(dir) => Self::shared(limits, dir.join("limits.json")),
-            None => Self::new(limits),
+    /// Shared buckets in `store` with `[cluster] state_dir`, else in-process.
+    pub fn from_config(config: &crate::config::Config, store: &Arc<dyn StateBackend>) -> Self {
+        match config.cluster.state_dir {
+            Some(_) => Self::shared(config.limits.clone(), Arc::clone(store)),
+            None => Self::new(config.limits.clone()),
         }
     }
 
@@ -198,8 +204,8 @@ impl Limiter {
 
     /// Charge `tool`'s cost to every scope, or return how long to wait.
     pub fn admit(&self, caller: &Caller<'_>, tool: &str, now: Instant) -> Result<(), Duration> {
-        if let Some(path) = &self.store {
-            return self.admit_file(path, caller, tool);
+        if let Some(store) = &self.store {
+            return self.admit_shared(store.as_ref(), caller, tool);
         }
         let cost = self.cost(tool);
         let scopes = self.scopes(caller);
@@ -271,115 +277,145 @@ impl Limiter {
         scopes
     }
 
-    /// Shared-file buckets. `Instant` is ignored; wall time is [`SystemTime`].
-    /// IO failure fails closed with a 1s retry so a poisoned file cannot
-    /// open the limiter.
-    fn admit_file(&self, path: &Path, caller: &Caller<'_>, tool: &str) -> Result<(), Duration> {
-        self.admit_file_io(path, caller, tool)
+    /// Shared buckets. `Instant` is ignored; wall time is [`SystemTime`].
+    /// A store failure fails closed with a 1s retry so a poisoned store
+    /// cannot open the limiter.
+    fn admit_shared(
+        &self,
+        store: &dyn StateBackend,
+        caller: &Caller<'_>,
+        tool: &str,
+    ) -> Result<(), Duration> {
+        let keys: Vec<(String, Rate)> = self
+            .scopes(caller)
+            .into_iter()
+            .map(|(scope, id, rate)| (file_key(scope, id), rate))
+            .collect();
+        let buckets: Vec<SharedBucket<'_>> = keys
+            .iter()
+            .map(|(key, rate)| SharedBucket { key, rate: *rate })
+            .collect();
+        store
+            .take(&buckets, self.cost(tool), now_ms())
             .unwrap_or_else(|error| {
                 eprintln!("shared rate-limit store failed: {error}");
                 Err(Duration::from_secs(1))
             })
     }
+}
 
-    fn admit_file_io(
-        &self,
-        path: &Path,
-        caller: &Caller<'_>,
-        tool: &str,
-    ) -> std::io::Result<Result<(), Duration>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Flock a sibling so process death cannot leave a half-written
-        // `limits.json`; the data file is replaced by rename.
-        let lock = OpenOptions::new()
-            .read(true)
+/// Charge `cost` to `buckets` in the shared file at `path`, under an
+/// exclusive flock of `<path>.lock`. The directory backend's limit store.
+pub(crate) fn take_file(
+    path: &Path,
+    buckets: &[SharedBucket<'_>],
+    cost: f64,
+    now_ms: u64,
+) -> std::io::Result<Result<(), Duration>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Flock a sibling so process death cannot leave a half-written
+    // `limits.json`; the data file is replaced by rename.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    let _lock = FileLock::exclusive(lock)?;
+    let mut store = read_store(path)?;
+    let result = charge(&mut store, buckets, cost, now_ms);
+    let out = serde_json::to_vec(&store)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut tmp_file = OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(path.with_extension("lock"))?;
-        let _lock = FileLock::exclusive(lock)?;
-        let mut store: FileStore = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileStore::default(),
-            Err(error) => return Err(error),
-        };
-        let result = self.admit_store(&mut store, caller, tool, now_ms());
-        let out = serde_json::to_vec(&store)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let tmp = path.with_extension("tmp");
-        {
-            let mut tmp_file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
-            tmp_file.write_all(&out)?;
-            tmp_file.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            let _ = File::open(parent).and_then(|dir| dir.sync_all());
-        }
-        Ok(result)
+            .truncate(true)
+            .open(&tmp)?;
+        tmp_file.write_all(&out)?;
+        tmp_file.sync_all()?;
     }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        let _ = File::open(parent).and_then(|dir| dir.sync_all());
+    }
+    Ok(result)
+}
 
-    fn admit_store(
-        &self,
-        store: &mut FileStore,
-        caller: &Caller<'_>,
-        tool: &str,
-        now_ms: u64,
-    ) -> Result<(), Duration> {
-        let cost = self.cost(tool);
-        let scopes = self.scopes(caller);
-        if store.buckets.len() > TABLE_LIMIT {
-            store.buckets.retain(|_, bucket| {
-                now_ms < bucket.full_at_ms
-                    || now_ms.saturating_sub(bucket.at_ms) < IDLE.as_millis() as u64
-            });
-        }
-        let mut wait = Duration::ZERO;
-        for (scope, key, rate) in &scopes {
-            let bucket = store
-                .buckets
-                .entry(file_key(*scope, key))
-                .or_insert(FileBucket {
-                    tokens: rate.burst,
-                    at_ms: now_ms,
-                    full_at_ms: now_ms,
-                });
-            if now_ms > bucket.at_ms {
-                let elapsed = (now_ms - bucket.at_ms) as f64 / 1000.0;
-                bucket.tokens = (bucket.tokens + elapsed * rate.rate_per_sec).min(rate.burst);
-                bucket.at_ms = now_ms;
-            }
-            let missing = cost - bucket.tokens;
-            if missing > 0.0 {
-                let seconds = missing / rate.rate_per_sec;
-                wait = wait.max(Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX));
-            }
-        }
-        if !wait.is_zero() {
-            return Err(wait);
-        }
-        for (scope, key, rate) in &scopes {
-            if let Some(bucket) = store.buckets.get_mut(&file_key(*scope, key)) {
-                bucket.tokens -= cost;
-                let refill = (rate.burst - bucket.tokens) / rate.rate_per_sec;
-                bucket.full_at_ms = Duration::try_from_secs_f64(refill)
-                    .ok()
-                    .and_then(|refill| now_ms.checked_add(refill.as_millis() as u64))
-                    .unwrap_or(now_ms.saturating_add(IDLE.as_millis() as u64 * 1_000));
-            }
-        }
-        Ok(())
+/// Whether [`take_file`] could run: under the same lock, the buckets parse
+/// and a scratch file can be written, synced and renamed next to them.
+/// `limits.json` itself is never touched.
+pub(crate) fn probe_file(path: &Path) -> std::io::Result<()> {
+    // `take_file` creates the state directory.
+    let parent = crate::state::Parent::Created;
+    let _lock = crate::state::probe_lock(&path.with_extension("lock"), true, parent)?;
+    read_store(path)?;
+    crate::state::probe_writable(path, parent)
+}
+
+fn read_store(path: &Path) -> std::io::Result<FileStore> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileStore::default()),
+        Err(error) => Err(error),
     }
+}
+
+/// The bucket arithmetic of the shared store, on wall-clock milliseconds.
+fn charge(
+    store: &mut FileStore,
+    buckets: &[SharedBucket<'_>],
+    cost: f64,
+    now_ms: u64,
+) -> Result<(), Duration> {
+    if store.buckets.len() > TABLE_LIMIT {
+        store.buckets.retain(|_, bucket| {
+            now_ms < bucket.full_at_ms
+                || now_ms.saturating_sub(bucket.at_ms) < IDLE.as_millis() as u64
+        });
+    }
+    let mut wait = Duration::ZERO;
+    for SharedBucket { key, rate } in buckets {
+        let bucket = store
+            .buckets
+            .entry((*key).to_string())
+            .or_insert(FileBucket {
+                tokens: rate.burst,
+                at_ms: now_ms,
+                full_at_ms: now_ms,
+            });
+        if now_ms > bucket.at_ms {
+            let elapsed = (now_ms - bucket.at_ms) as f64 / 1000.0;
+            bucket.tokens = (bucket.tokens + elapsed * rate.rate_per_sec).min(rate.burst);
+            bucket.at_ms = now_ms;
+        }
+        let missing = cost - bucket.tokens;
+        if missing > 0.0 {
+            let seconds = missing / rate.rate_per_sec;
+            wait = wait.max(Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX));
+        }
+    }
+    if !wait.is_zero() {
+        return Err(wait);
+    }
+    for SharedBucket { key, rate } in buckets {
+        if let Some(bucket) = store.buckets.get_mut(*key) {
+            bucket.tokens -= cost;
+            let refill = (rate.burst - bucket.tokens) / rate.rate_per_sec;
+            bucket.full_at_ms = Duration::try_from_secs_f64(refill)
+                .ok()
+                .and_then(|refill| now_ms.checked_add(refill.as_millis() as u64))
+                .unwrap_or(now_ms.saturating_add(IDLE.as_millis() as u64 * 1_000));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -497,6 +533,10 @@ mod tests {
         })
     }
 
+    fn dir_store(dir: &tempfile::TempDir) -> Arc<dyn StateBackend> {
+        Arc::new(crate::state::Directory::in_dir(dir.path()))
+    }
+
     fn caller() -> Caller<'static> {
         Caller {
             agent: "agent-7",
@@ -589,7 +629,6 @@ mod tests {
     #[test]
     fn two_limiters_share_file_buckets() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("limits.json");
         let config = LimitsConfig {
             agent: Rate {
                 rate_per_sec: 1.0,
@@ -597,8 +636,8 @@ mod tests {
             },
             ..LimitsConfig::default()
         };
-        let a = Limiter::shared(config.clone(), &path);
-        let b = Limiter::shared(config, &path);
+        let a = Limiter::shared(config.clone(), dir_store(&dir));
+        let b = Limiter::shared(config, dir_store(&dir));
         let now = Instant::now();
         assert!(a.admit(&caller(), "t", now).is_ok());
         assert!(b.admit(&caller(), "t", now).is_ok());
@@ -608,7 +647,6 @@ mod tests {
     #[test]
     fn shared_file_serializes_concurrent_admits() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("limits.json");
         let config = LimitsConfig {
             agent: Rate {
                 rate_per_sec: 0.001,
@@ -616,8 +654,8 @@ mod tests {
             },
             ..LimitsConfig::default()
         };
-        let a = Limiter::shared(config.clone(), &path);
-        let b = Limiter::shared(config, &path);
+        let a = Limiter::shared(config.clone(), dir_store(&dir));
+        let b = Limiter::shared(config, dir_store(&dir));
         let ok = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for limiter in [&a, &b] {
@@ -637,7 +675,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limits.json");
         std::fs::write(&path, "not-json").unwrap();
-        let limiter = Limiter::shared(LimitsConfig::default(), &path);
+        let limiter = Limiter::shared(LimitsConfig::default(), dir_store(&dir));
         let wait = limiter.admit(&caller(), "t", Instant::now()).unwrap_err();
         assert_eq!(wait, Duration::from_secs(1));
     }
@@ -647,7 +685,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limits.json");
         std::fs::write(&path, "").unwrap();
-        let limiter = Limiter::shared(LimitsConfig::default(), &path);
+        let limiter = Limiter::shared(LimitsConfig::default(), dir_store(&dir));
         let wait = limiter.admit(&caller(), "t", Instant::now()).unwrap_err();
         assert_eq!(wait, Duration::from_secs(1));
     }
@@ -657,7 +695,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("limits.json");
         std::fs::write(path.with_extension("tmp"), "not-json").unwrap();
-        let limiter = Limiter::shared(LimitsConfig::default(), &path);
+        let limiter = Limiter::shared(LimitsConfig::default(), dir_store(&dir));
         assert!(limiter.admit(&caller(), "t", Instant::now()).is_ok());
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(

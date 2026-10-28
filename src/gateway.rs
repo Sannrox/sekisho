@@ -7,7 +7,6 @@
 //! callable, with their approved description.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -22,13 +21,14 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{CallAudit, CallEvent, Decision, traceparent};
-use crate::config::{McpConfig, PolicyConfig, UpstreamConfig};
+use crate::config::{McpConfig, UpstreamConfig};
 use crate::discovery;
 use crate::exchange::Exchanger;
 use crate::limits::{Caller, Limiter, LimitsConfig, cap_response};
 use crate::metrics::Metrics;
-use crate::policy::{AgentPolicy, PolicyFile, agent_id};
+use crate::policy::{AgentPolicy, agent_id};
 use crate::registry::{self, Registry};
+use crate::state::StateBackend;
 use crate::verifier::{CallerToken, Principal};
 
 /// Longest wait for one upstream's tool listing during a refresh.
@@ -41,15 +41,15 @@ pub const PROTOCOL_VERSIONS: &[ProtocolVersion] =
 /// Upstreams and the registry snapshot the data plane serves from.
 pub struct Federation {
     pub upstreams: Vec<UpstreamConfig>,
-    pub registry_file: PathBuf,
+    store: Arc<dyn StateBackend>,
     registry: RwLock<Registry>,
 }
 
 impl Federation {
-    pub fn new(upstreams: Vec<UpstreamConfig>, registry_file: PathBuf) -> Self {
+    pub fn new(upstreams: Vec<UpstreamConfig>, store: Arc<dyn StateBackend>) -> Self {
         Self {
             upstreams,
-            registry_file,
+            store,
             registry: RwLock::default(),
         }
     }
@@ -61,7 +61,7 @@ impl Federation {
             .clone()
     }
 
-    /// Re-list every upstream, merge the listings into the registry file,
+    /// Re-list every upstream, merge the listings into the stored registry,
     /// and serve the result. An unreachable upstream lists nothing, so its
     /// tools stop being served until it answers again.
     pub async fn refresh(&self) -> Result<(), registry::RegistryError> {
@@ -83,13 +83,16 @@ impl Federation {
         }
         let listings = listings.join_all().await;
         let configured: Vec<&str> = self.upstreams.iter().map(|u| u.name.as_str()).collect();
-        let ((), registry) = registry::edit(&self.registry_file, |registry| {
-            registry.retain_upstreams(&configured);
-            for (upstream, listed) in &listings {
-                registry.observe(upstream, listed);
-            }
-            Ok(())
-        })?;
+        let registry = self.store.edit_registry(
+            &mut |registry| {
+                registry.retain_upstreams(&configured);
+                for (upstream, listed) in &listings {
+                    registry.observe(upstream, listed);
+                }
+                Ok(())
+            },
+            None,
+        )?;
         *self
             .registry
             .write()
@@ -114,7 +117,7 @@ impl Federation {
 #[derive(Clone)]
 pub struct Gateway {
     federation: Arc<Federation>,
-    policy: Arc<PolicyConfig>,
+    store: Arc<dyn StateBackend>,
     exchanger: Arc<Exchanger>,
     audit: Arc<CallAudit>,
     metrics: Arc<Metrics>,
@@ -206,16 +209,18 @@ impl Refused {
 }
 
 impl Gateway {
+    /// `store` serves agent policy; the federation, audit and limiter are
+    /// expected to use the same backend.
     pub fn new(
         federation: Arc<Federation>,
-        policy: PolicyConfig,
+        store: Arc<dyn StateBackend>,
         exchanger: Exchanger,
         audit: CallAudit,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             federation,
-            policy: Arc::new(policy),
+            store,
             exchanger: Arc::new(exchanger),
             audit: Arc::new(audit),
             metrics,
@@ -238,6 +243,11 @@ impl Gateway {
     pub fn mitigations(mut self, store: crate::mitigations::MitigationStore) -> Self {
         self.mitigations = Some(Arc::new(store));
         self
+    }
+
+    /// The state backend, for readiness.
+    pub fn state(&self) -> Arc<dyn StateBackend> {
+        Arc::clone(&self.store)
     }
 
     /// The call audit, shared with the `/audit/calls` read route.
@@ -279,9 +289,9 @@ impl Gateway {
     }
 
     /// The caller's agent policy, loaded fresh. Fails closed when the policy
-    /// file cannot be loaded; a malformed actor matches no agent.
+    /// cannot be loaded; a malformed actor matches no agent.
     fn agent_policy(&self, principal: &Principal) -> Result<Option<AgentPolicy>, McpError> {
-        let file = PolicyFile::load(&self.policy.file).map_err(|error| {
+        let file = self.store.policy().map_err(|error| {
             eprintln!("{error}");
             McpError::internal_error("agent policy is unavailable", None)
         })?;

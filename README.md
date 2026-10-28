@@ -15,7 +15,8 @@ Engines keep enforcing their own authorization, and Sekisho never holds a privil
 ```sh
 cp sekisho.example.toml sekisho.toml   # point jwks_file at your issuer's JWKS
 sekisho --config sekisho.toml serve    # prints "listening on <addr>"; MCP at /mcp
-curl http://127.0.0.1:8090/healthz
+curl http://127.0.0.1:8090/healthz    # liveness
+curl http://127.0.0.1:8090/readyz     # 503 while a state store cannot do work
 curl http://127.0.0.1:8090/metrics
 sekisho --config sekisho.toml diagnostics > bundle.json
 ```
@@ -67,6 +68,25 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   flock; a store error fails closed with a 1s retry. MCP sessions are
   already stateless (2026-07-28); registry, policy and audit stay files.
   Audit lines are fsynced before the response.
+- **State backend.** Rate-limit buckets, registry, policy, call audit and
+  mitigations go through one state backend. The directory backend, the
+  default and so far the only one, is the files described here, in the
+  same formats as earlier releases, so mixed versions can share them during
+  a rolling deploy. Its replicas need one host or a filesystem whose
+  exclusive locks they all see. `GET /readyz` answers 200 when every store
+  can do work and 503 otherwise, with `{"backend", "ready", "stores"}`
+  naming each store `ok` or `unavailable`; the reason goes to the log. A
+  store is ready when its data parses and its write path works: a scratch
+  file is created, synced, renamed and removed in its directory while the
+  store's writer lock is held, and its audit log opens with the writer's
+  options; an audit log's directory also takes the scratch write, so a full
+  disk shows even while the log opens. A probe creates no real file or directory: an absent lock file
+  or log is covered by the scratch check where the writer would create it.
+  A missing directory counts only where the writer creates it (the rate-limit
+  and mitigation state directory); a registry or audit file whose directory
+  is missing makes its store unavailable. Results
+  are reused for 1 s.
+  `/healthz` stays a liveness check.
 - **Approval gate.** Tools listed in `[approvals] marked` (destructive or
   open-world, by registry key) are forwarded only along an approval route. A
   marked tool also listed in `engine` goes to an upstream that parks and

@@ -1,6 +1,7 @@
-//! HTTP host: `/healthz`, `/metrics`, OAuth protected-resource metadata, the
-//! MCP endpoint at `/mcp` behind bearer authentication, and `/audit/calls`
-//! for configured audit readers.
+//! HTTP host: `/healthz` (liveness), `/readyz` (the state backend can do
+//! work), `/metrics`, OAuth protected-resource metadata, the MCP endpoint at
+//! `/mcp` behind bearer authentication, and `/audit/calls` for configured
+//! audit readers.
 
 use std::sync::Arc;
 
@@ -105,6 +106,9 @@ pub fn router(
             state: state.clone(),
             audit: gateway.audit(),
         }));
+    let readiness = Router::new()
+        .route("/readyz", get(readyz))
+        .with_state(gateway.state());
     let mcp_service = Router::new()
         .nest_service("/mcp", crate::gateway::service(mcp, gateway, shutdown))
         .layer(middleware::from_fn_with_state(auth, require_bearer));
@@ -118,6 +122,7 @@ pub fn router(
         .route("/.well-known/oauth-protected-resource/mcp", metadata_route)
         .with_state(state)
         .merge(audit_reads)
+        .merge(readiness)
         .merge(mcp_service)
         // Outermost, so preflights (no token) and metadata fetches get it.
         .layer(cors(&mcp.allowed_origins))
@@ -287,6 +292,31 @@ async fn audit_calls(
         Ok(Ok(page)) => axum::Json(page).into_response(),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "audit unavailable\n").into_response(),
     }
+}
+
+/// `GET /readyz`: 200 when every store of the state backend can do work,
+/// else 503. The body names the backend and each store as `ok` or
+/// `unavailable`; reasons go to the log only, since they carry paths.
+async fn readyz(State(store): State<Arc<dyn crate::state::StateBackend>>) -> Response {
+    let kind = store.kind();
+    let Ok(probe) = tokio::task::spawn_blocking(move || store.probe()).await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "readiness probe failed\n").into_response();
+    };
+    let mut stores = std::collections::BTreeMap::new();
+    for (name, result) in probe {
+        if let Err(reason) = &result {
+            eprintln!("readiness: {name} store unavailable: {reason}");
+        }
+        stores.insert(name, if result.is_ok() { "ok" } else { "unavailable" });
+    }
+    let ready = stores.values().all(|state| *state == "ok");
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let body = serde_json::json!({ "backend": kind, "ready": ready, "stores": stores });
+    (status, axum::Json(body)).into_response()
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {

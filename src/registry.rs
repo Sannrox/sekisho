@@ -1,10 +1,11 @@
 //! Tool registry: upstream tools, their description versions, and owner state.
 //!
-//! The registry file is the source of truth. The gateway re-reads it and
-//! re-lists upstreams every refresh interval, so owner edits and upstream
-//! changes take effect without a restart. Every read-modify-write holds an
-//! exclusive lock on `<file>.lock`, so the gateway's refresh and an owner's
-//! edit cannot overwrite each other.
+//! The registry in the state backend ([`crate::state`]) is the source of
+//! truth. The gateway re-reads it and re-lists upstreams every refresh
+//! interval, so owner edits and upstream changes take effect without a
+//! restart. Every read-modify-write holds the backend's exclusive lock (in the
+//! directory backend, on `<file>.lock`), so the gateway's refresh and an
+//! owner's edit cannot overwrite each other.
 //!
 //! A newly discovered tool is disabled. A changed description or input schema
 //! becomes a pending version; agents keep seeing the approved one until the
@@ -17,6 +18,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::state::StateBackend;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -177,12 +180,12 @@ impl Registry {
     }
 }
 
-/// Load, change, and save the registry at `path` under its lock.
-pub fn edit<T>(
+/// Load, change, and save the registry at `path` under its lock. The
+/// directory backend's registry edit.
+pub(crate) fn edit<T>(
     path: &Path,
     change: impl FnOnce(&mut Registry) -> Result<T, RegistryError>,
 ) -> Result<(T, Registry), RegistryError> {
-    let lock_path = path.with_extension("lock");
     let io = |action, path: &Path| {
         let path = path.to_path_buf();
         move |source| RegistryError::Io {
@@ -191,13 +194,7 @@ pub fn edit<T>(
             source,
         }
     };
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .map_err(io("opening", &lock_path))?;
-    lock.lock().map_err(io("locking", &lock_path))?;
+    let lock = lock(path)?;
     let mut registry = Registry::load(path)?;
     let value = change(&mut registry)?;
     let staged = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -211,6 +208,49 @@ pub fn edit<T>(
     Ok((value, registry))
 }
 
+/// The exclusive lock on `<path>.lock` every registry edit holds.
+fn lock(path: &Path) -> Result<File, RegistryError> {
+    let lock_path = path.with_extension("lock");
+    let io = |action| {
+        let path = lock_path.clone();
+        move |source| RegistryError::Io {
+            action,
+            path,
+            source,
+        }
+    };
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(io("opening"))?;
+    lock.lock().map_err(io("locking"))?;
+    Ok(lock)
+}
+
+/// Whether [`edit`] and [`append_record`] could run: under the registry
+/// lock, the registry parses and a scratch file can be written and renamed
+/// next to it, and the owner audit opens as its writer opens it.
+pub(crate) fn probe(path: &Path, audit: &Path) -> Result<(), RegistryError> {
+    let io = |action, path: &Path| {
+        let path = path.to_path_buf();
+        move |source| RegistryError::Io {
+            action,
+            path,
+            source,
+        }
+    };
+    let lock_path = path.with_extension("lock");
+    let _lock = crate::state::probe_lock(&lock_path, false, crate::state::Parent::MustExist)
+        .map_err(io("locking", &lock_path))?;
+    Registry::load(path)?;
+    crate::state::probe_writable(path, crate::state::Parent::MustExist)
+        .map_err(io("writing next to", path))?;
+    crate::state::probe_append(audit, false, crate::state::Parent::MustExist)
+        .map_err(io("opening", audit))
+}
+
 /// One owner edit, as appended to the audit file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -220,22 +260,36 @@ pub struct AuditRecord {
     pub tool: String,
 }
 
-/// Apply an owner edit and append its audit record. The record is written
-/// under the registry lock before the registry file is replaced, so a change
-/// that cannot be audited is never committed.
+/// Apply an owner edit and audit it. The record is durable before the
+/// change is committed, so a change that cannot be audited is never
+/// committed.
 pub fn owner_edit(
-    registry: &Path,
-    audit: &Path,
+    store: &dyn StateBackend,
     owner: &str,
     action: &str,
     tool: &str,
-    change: impl FnOnce(&mut Registry) -> Result<(), RegistryError>,
+    mut change: impl FnMut(&mut Registry) -> Result<(), RegistryError>,
 ) -> Result<Registry, RegistryError> {
     if owner.trim().is_empty() {
         return Err(RegistryError::Invalid(
             "registry edits need an owner".into(),
         ));
     }
+    let record = AuditRecord {
+        at_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |at| at.as_millis()),
+        owner: owner.into(),
+        action: action.into(),
+        tool: tool.into(),
+    };
+    store.edit_registry(&mut change, Some(&record))
+}
+
+/// Append `record` to the owner audit file at `audit` and sync it. The
+/// directory backend calls it under the registry lock, before the registry
+/// file is replaced.
+pub(crate) fn append_record(audit: &Path, record: &AuditRecord) -> Result<(), RegistryError> {
     let audit_error = |action: &'static str| {
         let path = audit.to_path_buf();
         move |source| RegistryError::Io {
@@ -244,30 +298,18 @@ pub fn owner_edit(
             source,
         }
     };
-    let ((), registry) = edit(registry, |registry| {
-        change(registry)?;
-        let record = AuditRecord {
-            at_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |at| at.as_millis()),
-            owner: owner.into(),
-            action: action.into(),
-            tool: tool.into(),
-        };
-        let mut line = serde_json::to_vec(&record).map_err(|source| RegistryError::Parse {
-            path: audit.into(),
-            source,
-        })?;
-        line.push(b'\n');
-        let mut log: File = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(audit)
-            .map_err(audit_error("opening"))?;
-        log.write_all(&line).map_err(audit_error("appending to"))?;
-        log.sync_data().map_err(audit_error("syncing"))
+    let mut line = serde_json::to_vec(record).map_err(|source| RegistryError::Parse {
+        path: audit.into(),
+        source,
     })?;
-    Ok(registry)
+    line.push(b'\n');
+    let mut log: File = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(audit)
+        .map_err(audit_error("opening"))?;
+    log.write_all(&line).map_err(audit_error("appending to"))?;
+    log.sync_data().map_err(audit_error("syncing"))
 }
 
 #[cfg(test)]

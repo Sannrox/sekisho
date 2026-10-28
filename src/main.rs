@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 use sekisho::config::Config;
 use sekisho::gateway::Federation;
-use sekisho::registry::{self, Registry};
+use sekisho::registry;
 use sekisho::server::{AppState, router};
 use sekisho::verifier::Verifier;
 
@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve `/mcp`, its OAuth metadata, `/healthz` and `/metrics`. Prints
+    /// Serve `/mcp`, its OAuth metadata, `/healthz`, `/readyz` and `/metrics`. Prints
     /// `listening on <addr>` once bound.
     Serve,
     /// Print a JSON support bundle with no secrets.
@@ -143,7 +143,7 @@ fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()>
     use sekisho::mitigations::{
         Mitigation, MitigationStore, Outcome, Scope, Standalone, Target, now_ms,
     };
-    let store = MitigationStore::new(&config.mitigations);
+    let store = MitigationStore::new(sekisho::state::open(config));
     let now = now_ms();
     let outcome = match command {
         MitigationCommand::List => {
@@ -196,20 +196,18 @@ fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()>
 }
 
 fn registry_command(config: &Config, command: RegistryCommand) -> Result<()> {
-    let (file, audit) = (&config.registry.file, &config.registry.audit_file);
+    let store = sekisho::state::open(config);
     let edit =
         |action: &str,
          tool: &str,
          owner: &str,
-         change: &dyn Fn(&mut Registry) -> Result<(), registry::RegistryError>| {
-            registry::owner_edit(file, audit, owner, action, tool, |registry| {
-                change(registry)
-            })
-            .map(|_| println!("{action} {tool}"))
+         change: &dyn Fn(&mut registry::Registry) -> Result<(), registry::RegistryError>| {
+            registry::owner_edit(store.as_ref(), owner, action, tool, change)
+                .map(|_| println!("{action} {tool}"))
         };
     match command {
         RegistryCommand::List => {
-            for (key, entry) in Registry::load(file)?.tools {
+            for (key, entry) in store.registry()?.tools {
                 let state = match (entry.enabled, entry.available) {
                     (true, true) => "enabled",
                     (false, true) => "disabled",
@@ -224,7 +222,7 @@ fn registry_command(config: &Config, command: RegistryCommand) -> Result<()> {
             }
         }
         RegistryCommand::Show { tool } => {
-            let registry = Registry::load(file)?;
+            let registry = store.registry()?;
             let entry = registry
                 .tools
                 .get(&tool)
@@ -259,9 +257,10 @@ async fn serve(config: &Config) -> Result<()> {
         metrics: metrics.clone(),
     });
     let shutdown = tokio_util::sync::CancellationToken::new();
+    let store = sekisho::state::open(config);
     let federation = Arc::new(Federation::new(
         config.upstreams.clone(),
-        config.registry.file.clone(),
+        Arc::clone(&store),
     ));
     tokio::spawn(federation.clone().run(
         Duration::from_millis(config.registry.refresh_interval_ms),
@@ -273,10 +272,9 @@ async fn serve(config: &Config) -> Result<()> {
     println!("listening on {}", listener.local_addr()?);
     let gateway = sekisho::gateway::Gateway::new(
         federation,
-        config.policy.clone(),
+        Arc::clone(&store),
         sekisho::exchange::Exchanger::new(config.exchange.clone()),
-        sekisho::audit::CallAudit::new(config.audit.calls_file.clone())
-            .readers(config.audit.readers.clone()),
+        sekisho::audit::CallAudit::new(Arc::clone(&store)).readers(config.audit.readers.clone()),
         metrics,
     )
     .progressive(config.mcp.progressive)
@@ -284,13 +282,10 @@ async fn serve(config: &Config) -> Result<()> {
         config.guardrails.clone(),
     ))
     .approvals(config.approvals.clone())
-    .mitigations(sekisho::mitigations::MitigationStore::new(
-        &config.mitigations,
-    ))
-    .limits(sekisho::limits::Limiter::from_config(
-        config.limits.clone(),
-        config.cluster.state_dir.as_deref(),
-    ));
+    .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
+        &store,
+    )))
+    .limits(sekisho::limits::Limiter::from_config(config, &store));
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

@@ -236,9 +236,10 @@ impl Stack {
             );
         std::fs::write(&path, text + extra_toml).unwrap();
         let config = Config::load(&path).unwrap();
+        let store = sekisho::state::open(&config);
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
-            config.registry.file.clone(),
+            Arc::clone(&store),
         ));
         tokio::spawn(
             federation
@@ -251,9 +252,9 @@ impl Stack {
         });
         let gateway = sekisho::gateway::Gateway::new(
             federation,
-            config.policy.clone(),
+            Arc::clone(&store),
             sekisho::exchange::Exchanger::new(config.exchange.clone()),
-            sekisho::audit::CallAudit::new(config.audit.calls_file.clone())
+            sekisho::audit::CallAudit::new(Arc::clone(&store))
                 .readers(config.audit.readers.clone()),
             Default::default(),
         )
@@ -261,13 +262,10 @@ impl Stack {
             config.guardrails.clone(),
         ))
         .approvals(config.approvals.clone())
-        .mitigations(sekisho::mitigations::MitigationStore::new(
-            &config.mitigations,
-        ))
-        .limits(sekisho::limits::Limiter::from_config(
-            config.limits.clone(),
-            config.cluster.state_dir.as_deref(),
-        ));
+        .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
+            &store,
+        )))
+        .limits(sekisho::limits::Limiter::from_config(&config, &store));
         let app = router(state, &config.mcp, gateway, stop.clone());
         let address = serve_on_loopback(app, stop.clone()).await;
         Self {
@@ -293,9 +291,10 @@ impl Stack {
     /// directory that points at this stack's shared files.
     pub async fn replica(&self, config: &Config) -> Replica {
         let stop = CancellationToken::new();
+        let store = sekisho::state::open(config);
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
-            config.registry.file.clone(),
+            Arc::clone(&store),
         ));
         federation.refresh().await.unwrap();
         tokio::spawn(
@@ -309,9 +308,9 @@ impl Stack {
         });
         let gateway = sekisho::gateway::Gateway::new(
             federation,
-            config.policy.clone(),
+            Arc::clone(&store),
             sekisho::exchange::Exchanger::new(config.exchange.clone()),
-            sekisho::audit::CallAudit::new(config.audit.calls_file.clone())
+            sekisho::audit::CallAudit::new(Arc::clone(&store))
                 .readers(config.audit.readers.clone()),
             Default::default(),
         )
@@ -319,13 +318,10 @@ impl Stack {
             config.guardrails.clone(),
         ))
         .approvals(config.approvals.clone())
-        .mitigations(sekisho::mitigations::MitigationStore::new(
-            &config.mitigations,
-        ))
-        .limits(sekisho::limits::Limiter::from_config(
-            config.limits.clone(),
-            config.cluster.state_dir.as_deref(),
-        ));
+        .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
+            &store,
+        )))
+        .limits(sekisho::limits::Limiter::from_config(config, &store));
         let app = router(state, &config.mcp, gateway, stop.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -403,8 +399,7 @@ impl Stack {
             .await
         );
         sekisho::registry::owner_edit(
-            &file,
-            &self.config.registry.audit_file,
+            sekisho::state::open(&self.config).as_ref(),
             "owner-1",
             "enable",
             tool,

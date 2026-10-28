@@ -7,16 +7,21 @@
 //! upstream call carries it in `traceparent` so the engine's receipt names
 //! the same trace.
 //!
-//! Replicas append to one shared file under an exclusive `flock`. Subjects in
+//! Events are stored by the state backend ([`crate::state`]). Subjects in
 //! `[audit] readers` read one trace back (`GET /audit/calls`), only for their
-//! own `tenant_id`, oldest first, paged by a byte cursor into the file. Reads
+//! own `tenant_id`, oldest first, paged by an opaque cursor.
+//!
+//! In the directory backend ([`CallLog`]) replicas append to one shared file
+//! under an exclusive `flock`, and the cursor is a byte offset into it. Reads
 //! take no lock, so they never hold up an append; they stop before a partial
 //! last line and scan a bounded number of bytes per page.
 
 use std::io::{BufRead as _, Read as _, Seek as _, Write as _};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::limits::FileLock;
+use crate::state::{StateBackend, StoreError};
 
 use serde::{Deserialize, Serialize};
 
@@ -78,14 +83,14 @@ pub struct CallPage {
 }
 
 pub struct CallAudit {
-    file: PathBuf,
+    store: Arc<dyn StateBackend>,
     readers: Vec<String>,
 }
 
 impl CallAudit {
-    pub fn new(file: PathBuf) -> Self {
+    pub fn new(store: Arc<dyn StateBackend>) -> Self {
         Self {
-            file,
+            store,
             readers: Vec::new(),
         }
     }
@@ -105,11 +110,46 @@ impl CallAudit {
         self.readers.iter().any(|reader| reader == subject)
     }
 
+    /// Events of `trace_id` recorded for `tenant` after `cursor`, at most
+    /// `limit` (capped at [`MAX_PAGE`]).
+    pub fn read(
+        &self,
+        tenant: &str,
+        trace_id: &str,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<CallPage, StoreError> {
+        self.store.read_calls(tenant, trace_id, cursor, limit)
+    }
+
+    /// Record one event, durable before it returns. A write failure is
+    /// reported, not fatal to the call.
+    pub fn record(&self, event: &CallEvent) {
+        if let Err(error) = self.store.record_call(event) {
+            eprintln!("recording call audit event failed: {error}");
+        }
+    }
+}
+
+/// The directory backend's call audit: one JSON line per event in one file.
+pub(crate) struct CallLog {
+    file: PathBuf,
+}
+
+impl CallLog {
+    pub(crate) fn new(file: PathBuf) -> Self {
+        Self { file }
+    }
+
+    pub(crate) fn file(&self) -> &std::path::Path {
+        &self.file
+    }
+
     /// Events of `trace_id` recorded for `tenant`, from byte `cursor` on, at
     /// most `limit` (capped at [`MAX_PAGE`]) and at most [`MAX_SCAN_BYTES`]
     /// scanned. A missing file is an empty page. Lines that do not parse (a
     /// cursor inside a line) are skipped.
-    pub fn read(
+    pub(crate) fn read(
         &self,
         tenant: &str,
         trace_id: &str,
@@ -170,34 +210,29 @@ impl CallAudit {
     }
 
     /// Append one event under the file lock, so replicas sharing the file do
-    /// not interleave lines. A write failure is reported, not fatal to the call.
-    pub fn record(&self, event: &CallEvent) {
-        let append = || -> std::io::Result<()> {
-            let mut line = serde_json::to_vec(event)?;
-            line.push(b'\n');
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .append(true)
-                .open(&self.file)?;
-            let mut lock = FileLock::exclusive(file)?;
-            // A writer that died mid-line left a fragment; end it so this
-            // event starts its own line instead of joining it.
-            let len = lock.file.metadata()?.len();
-            if len > 0 {
-                let mut last = [0_u8];
-                lock.file.seek(std::io::SeekFrom::Start(len - 1))?;
-                lock.file.read_exact(&mut last)?;
-                if last[0] != b'\n' {
-                    line.insert(0, b'\n');
-                }
+    /// not interleave lines, and fsync it.
+    pub(crate) fn append(&self, event: &CallEvent) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(event)?;
+        line.push(b'\n');
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.file)?;
+        let mut lock = FileLock::exclusive(file)?;
+        // A writer that died mid-line left a fragment; end it so this
+        // event starts its own line instead of joining it.
+        let len = lock.file.metadata()?.len();
+        if len > 0 {
+            let mut last = [0_u8];
+            lock.file.seek(std::io::SeekFrom::Start(len - 1))?;
+            lock.file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                line.insert(0, b'\n');
             }
-            lock.file.write_all(&line)?;
-            lock.file.sync_all()
-        };
-        if let Err(error) = append() {
-            eprintln!("recording call audit event failed: {error}");
         }
+        lock.file.write_all(&line)?;
+        lock.file.sync_all()
     }
 }
 
@@ -274,13 +309,13 @@ mod tests {
     #[test]
     fn reads_page_one_tenants_trace_and_stop_before_a_torn_line() {
         let dir = tempfile::tempdir().unwrap();
-        let audit = CallAudit::new(dir.path().join("calls.jsonl"));
+        let audit = CallLog::new(dir.path().join("calls.jsonl"));
         let (trace, other) = ("a".repeat(32), "b".repeat(32));
         assert!(audit.read("t1", &trace, 0, 10).unwrap().events.is_empty());
         for tool in ["one", "two", "three"] {
-            audit.record(&event(&trace, Some("t1"), tool));
-            audit.record(&event(&other, Some("t1"), tool));
-            audit.record(&event(&trace, Some("t2"), tool));
+            audit.append(&event(&trace, Some("t1"), tool)).unwrap();
+            audit.append(&event(&other, Some("t1"), tool)).unwrap();
+            audit.append(&event(&trace, Some("t2"), tool)).unwrap();
         }
         let first = audit.read("t1", &trace, 0, 2).unwrap();
         let tools = |page: &CallPage| {
@@ -316,12 +351,12 @@ mod tests {
     fn a_sparse_read_stops_at_the_scan_budget_and_continues() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("calls.jsonl");
-        let audit = CallAudit::new(path.clone());
+        let audit = CallLog::new(path.clone());
         let (trace, other) = ("a".repeat(32), "b".repeat(32));
         let filler = serde_json::to_string(&event(&other, Some("t1"), "noise")).unwrap() + "\n";
         let copies = (MAX_SCAN_BYTES as usize / filler.len()) + 10;
         std::fs::write(&path, filler.repeat(copies)).unwrap();
-        audit.record(&event(&trace, Some("t1"), "late"));
+        audit.append(&event(&trace, Some("t1"), "late")).unwrap();
         let first = audit.read("t1", &trace, 0, 10).unwrap();
         assert!(first.events.is_empty() && !first.complete);
         assert!(first.next_cursor > MAX_SCAN_BYTES - filler.len() as u64);
@@ -339,11 +374,11 @@ mod tests {
     fn a_line_longer_than_the_budget_is_skipped_across_pages() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("calls.jsonl");
-        let audit = CallAudit::new(path.clone());
+        let audit = CallLog::new(path.clone());
         let trace = "a".repeat(32);
         let huge = "x".repeat(MAX_SCAN_BYTES as usize * 3 / 2) + "\n";
         std::fs::write(&path, huge).unwrap();
-        audit.record(&event(&trace, Some("t1"), "after"));
+        audit.append(&event(&trace, Some("t1"), "after")).unwrap();
         let (mut cursor, mut found) = (0, Vec::new());
         for _ in 0..4 {
             let page = audit.read("t1", &trace, cursor, 10).unwrap();
@@ -360,10 +395,10 @@ mod tests {
     fn an_append_after_a_torn_tail_starts_its_own_line() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("calls.jsonl");
-        let audit = CallAudit::new(path.clone());
+        let audit = CallLog::new(path.clone());
         let trace = "a".repeat(32);
         std::fs::write(&path, b"{\"torn").unwrap();
-        audit.record(&event(&trace, Some("t1"), "after"));
+        audit.append(&event(&trace, Some("t1"), "after")).unwrap();
         let page = audit.read("t1", &trace, 0, 10).unwrap();
         assert_eq!(page.events.len(), 1);
         assert!(page.complete);
