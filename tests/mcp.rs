@@ -37,7 +37,7 @@ async fn start() -> Running {
         metrics: Default::default(),
     });
     let shutdown = CancellationToken::new();
-    let store = sekisho::state::open(&config);
+    let store = sekisho::state::open(&config).unwrap();
     let federation = Arc::new(sekisho::gateway::Federation::new(
         Vec::new(),
         Arc::clone(&store),
@@ -210,7 +210,7 @@ async fn configured_browser_origins_pass_cors_preflight() {
         metrics: Default::default(),
     });
     let shutdown = CancellationToken::new();
-    let store = sekisho::state::open(&config);
+    let store = sekisho::state::open(&config).unwrap();
     let federation = Arc::new(sekisho::gateway::Federation::new(
         Vec::new(),
         Arc::clone(&store),

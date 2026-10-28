@@ -6,7 +6,7 @@ mod support;
 use std::time::Duration;
 
 use sekisho::audit::{CallEvent, Decision};
-use support::stack::{Stack, echo_call, eventually};
+use support::stack::{Stack, echo_call, eventually, readiness_settles, readyz};
 
 const AGENTS: &str = "[[agents]]\nid = \"agent-7\"\ntools = [\"tools.echo\"]\n";
 const CLUSTER: &str = "\n[cluster]\nstate_dir = \"cluster\"\n[limits]\nagent = { rate_per_sec = 0.001, burst = 2.0 }\n";
@@ -97,14 +97,6 @@ async fn in_flight_on_a_killed_replica_fails_and_retry_succeeds() {
     let _ = client_b.cancel().await;
 }
 
-async fn readyz(address: &str) -> (u16, serde_json::Value) {
-    let response = reqwest::get(format!("http://{address}/readyz"))
-        .await
-        .unwrap();
-    let status = response.status().as_u16();
-    (status, response.json().await.unwrap())
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_broken_store_fails_readiness_and_calls_closed_until_it_recovers() {
     // Default limits, so warm-up calls cannot exhaust a bucket.
@@ -143,19 +135,6 @@ async fn a_broken_store_fails_readiness_and_calls_closed_until_it_recovers() {
     readiness_settles(&stack.address, 200).await;
     client.call_tool(echo_call("2")).await.unwrap();
     let _ = client.cancel().await;
-}
-
-/// Poll `/readyz` past the probe cache until it answers `status`.
-async fn readiness_settles(address: &str, status: u16) -> serde_json::Value {
-    let mut last = serde_json::Value::Null;
-    let settled = eventually(Duration::from_secs(5), async || {
-        let (got, body) = readyz(address).await;
-        last = body;
-        got == status
-    })
-    .await;
-    assert!(settled, "readyz never answered {status}: {last}");
-    last
 }
 
 #[tokio::test(flavor = "multi_thread")]

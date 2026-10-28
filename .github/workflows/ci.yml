@@ -38,3 +38,22 @@ jobs:
         with:
           components: clippy
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked --features postgres -- -D warnings
+  postgres:
+    name: PostgreSQL backend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: sekisho
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 15
+    env:
+      SEKISHO_TEST_POSTGRES_URL: postgres://postgres:sekisho@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: cargo test --locked --features postgres --test state_backends

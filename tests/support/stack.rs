@@ -34,6 +34,9 @@ struct Upstream {
     traceparents: Arc<Mutex<Vec<Option<String>>>>,
     /// Set when a `hold` call has reached the upstream, before it sleeps.
     hold_entered: Arc<std::sync::atomic::AtomicBool>,
+    /// A `pause` call sets `paused` and answers once `resume` is notified.
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    resume: Arc<tokio::sync::Notify>,
 }
 
 /// Claims of a delegated token, if signed by the issuer for this audience.
@@ -108,6 +111,10 @@ impl ServerHandler for Upstream {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
+        if text == "pause" {
+            self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.resume.notified().await;
+        }
         Ok(CallToolResponse::Complete(CallToolResult::success(vec![
             ContentBlock::text(format!("echo {text}")),
         ])))
@@ -137,6 +144,28 @@ pub async fn eventually(limit: Duration, mut condition: impl AsyncFnMut() -> boo
     false
 }
 
+/// `GET /readyz`: status and body.
+pub async fn readyz(address: &str) -> (u16, serde_json::Value) {
+    let response = reqwest::get(format!("http://{address}/readyz"))
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    (status, response.json().await.unwrap())
+}
+
+/// Poll `/readyz` past the probe cache until it answers `status`.
+pub async fn readiness_settles(address: &str, status: u16) -> serde_json::Value {
+    let mut last = serde_json::Value::Null;
+    let settled = eventually(Duration::from_secs(5), async || {
+        let (got, body) = readyz(address).await;
+        last = body;
+        got == status
+    })
+    .await;
+    assert!(settled, "readyz never answered {status}: {last}");
+    last
+}
+
 pub fn echo_call(text: &str) -> CallToolRequestParams {
     let mut call = CallToolRequestParams::new("tools.echo");
     call.arguments = serde_json::json!({ "text": text }).as_object().cloned();
@@ -156,6 +185,9 @@ pub struct Stack {
     pub issuer_down: Arc<std::sync::atomic::AtomicBool>,
     /// An upstream `hold` call has started sleeping.
     pub hold_entered: Arc<std::sync::atomic::AtomicBool>,
+    /// An upstream `pause` call is waiting for [`Self::resume`].
+    pub paused: Arc<std::sync::atomic::AtomicBool>,
+    pub resume: Arc<tokio::sync::Notify>,
     stop: CancellationToken,
     _fixture: Fixture,
 }
@@ -203,7 +235,11 @@ impl Stack {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let traceparents = Arc::new(Mutex::new(Vec::new()));
         let hold_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let resume = Arc::new(tokio::sync::Notify::new());
         let upstream = Upstream {
+            paused: paused.clone(),
+            resume: resume.clone(),
             description: description.clone(),
             seen: seen.clone(),
             traceparents: traceparents.clone(),
@@ -236,7 +272,7 @@ impl Stack {
             );
         std::fs::write(&path, text + extra_toml).unwrap();
         let config = Config::load(&path).unwrap();
-        let store = sekisho::state::open(&config);
+        let store = sekisho::state::open(&config).unwrap();
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
             Arc::clone(&store),
@@ -277,6 +313,8 @@ impl Stack {
             traceparents,
             issuer_down,
             hold_entered,
+            paused,
+            resume,
             stop,
             _fixture: fixture,
         }
@@ -291,7 +329,7 @@ impl Stack {
     /// directory that points at this stack's shared files.
     pub async fn replica(&self, config: &Config) -> Replica {
         let stop = CancellationToken::new();
-        let store = sekisho::state::open(config);
+        let store = sekisho::state::open(config).unwrap();
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
             Arc::clone(&store),
@@ -399,7 +437,7 @@ impl Stack {
             .await
         );
         sekisho::registry::owner_edit(
-            sekisho::state::open(&self.config).as_ref(),
+            sekisho::state::open(&self.config).unwrap().as_ref(),
             "owner-1",
             "enable",
             tool,

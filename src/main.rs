@@ -143,7 +143,7 @@ fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()>
     use sekisho::mitigations::{
         Mitigation, MitigationStore, Outcome, Scope, Standalone, Target, now_ms,
     };
-    let store = MitigationStore::new(sekisho::state::open(config));
+    let store = MitigationStore::new(sekisho::state::open(config)?);
     let now = now_ms();
     let outcome = match command {
         MitigationCommand::List => {
@@ -196,7 +196,7 @@ fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()>
 }
 
 fn registry_command(config: &Config, command: RegistryCommand) -> Result<()> {
-    let store = sekisho::state::open(config);
+    let store = sekisho::state::open(config)?;
     let edit =
         |action: &str,
          tool: &str,
@@ -257,7 +257,31 @@ async fn serve(config: &Config) -> Result<()> {
         metrics: metrics.clone(),
     });
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let store = sekisho::state::open(config);
+    let store = sekisho::state::open(config)?;
+    // Probe once now, waiting at most the store deadline: a PostgreSQL
+    // store connects and migrates its schema, and a store that cannot do
+    // work shows in the log. Serving starts either way, as with an
+    // unreachable store; `/readyz` reports not ready until it recovers.
+    let startup = Arc::clone(&store);
+    let probe = sekisho::state::blocking(
+        sekisho::state::Store::Limits,
+        &mut sekisho::state::STORE_DEADLINE.clone(),
+        move || Ok(startup.probe()),
+    )
+    .await;
+    match probe {
+        Ok(probe) => {
+            for (name, result) in probe {
+                if let Err(reason) = result {
+                    eprintln!("startup: {name} store unavailable: {reason}");
+                }
+            }
+        }
+        Err(_) => eprintln!(
+            "startup: the state backend did not answer within {:?}; serving while it recovers",
+            sekisho::state::STORE_DEADLINE
+        ),
+    }
     let federation = Arc::new(Federation::new(
         config.upstreams.clone(),
         Arc::clone(&store),

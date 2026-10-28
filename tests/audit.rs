@@ -138,7 +138,11 @@ async fn a_reader_reads_its_tenants_trace_in_order_and_no_one_elses() {
 
     let (status, page) = read_trace(&stack.address, "console", Some("t1"), trace).await;
     assert_eq!(status, 200);
-    assert_eq!(decisions(&page), ["agent-7:allowed", "agent-9:denied"]);
+    // A forwarded call is `started`, then its outcome; a refusal is one event.
+    assert_eq!(
+        decisions(&page),
+        ["agent-7:started", "agent-7:allowed", "agent-9:denied"]
+    );
     assert_eq!(page["complete"], true);
     assert!(!page.to_string().contains("echo hi"), "no payloads: {page}");
 
@@ -187,7 +191,8 @@ async fn either_replica_reads_events_both_replicas_appended() {
     }
     for address in [&a.address, &b.address] {
         let (status, page) = read_trace(address, "console", Some("t1"), trace).await;
-        assert_eq!((status, decisions(&page).len()), (200, 2));
+        // Each call's `started` and `allowed` events.
+        assert_eq!((status, decisions(&page).len()), (200, 4));
     }
     a.kill();
     b.kill();
