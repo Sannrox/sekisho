@@ -39,6 +39,15 @@ jobs:
           components: clippy
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo clippy --all-targets --locked --features postgres -- -D warnings
+  workflow-skills:
+    name: Workflow Skills
+    runs-on: ubuntu-latest
+    steps:
+      # The check runs agent-kit main; keep the job token out of .git/config.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: bash scripts/validate-workflow-skills.sh
   postgres:
     name: PostgreSQL backend
     runs-on: ubuntu-latest

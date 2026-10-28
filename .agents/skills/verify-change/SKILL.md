@@ -1,63 +1,25 @@
 ---
 name: verify-change
-description: Verify a sekisho Rust, protocol, documentation, configuration, or workflow change with proportionate deterministic checks. Use after implementation, before review, or when a contributor needs an exact evidence report without overstating unrun tests.
+description: Verify a Rust, documentation, configuration, or workflow change with proportionate deterministic checks. Use after implementation, before review, or when a contributor needs an exact evidence report without overstating unrun tests. Uses the shared Sannrox agent-kit installation.
 ---
 
 # Verify Change
 
-Run the narrowest useful checks first, then expand according to change risk.
+Use the canonical [verify-change skill](https://github.com/Sannrox/agent-kit/tree/main/skills/verify-change).
+Read the complete installed `~/.agents/agent-kit/skills/verify-change/SKILL.md` and the
+references it requires before starting. If installed at another operator-selected location
+(`$AGENT_KIT_HOME`), use that installation. This repository entrypoint contains no
+workflow implementation.
 
-## Procedure
+If the skill is missing, run `bash scripts/validate-workflow-skills.sh` from this repository
+(it clones or updates the kit), or clone it directly:
+`git clone https://github.com/Sannrox/agent-kit ~/.agents/agent-kit`. Run `git pull` in that
+checkout to get the latest version; consumers always use `main`.
 
-1. Inspect `git status`, the diff, and the stated outcome. Preserve unrelated
-   worktree changes. Use `assess-change-impact` when risk is unclear. Complete
-   when every changed path is classified.
-2. Run focused tests for the affected module or integration first. Add checks
-   based on the surface:
+Run the shared skill's scripts from the repository being changed, preserving its working
+directory. Follow this repository's `AGENTS.md` (including `## Agent skill profile`) in addition to the
+canonical skill.
 
-   | Surface | Required evidence |
-   | --- | --- |
-   | Rust source | focused tests plus `cargo clippy --all-targets --locked -- -D warnings` |
-   | MCP / gateway | affected integration test under `tests/` plus the normal suite |
-   | configuration | parsing/default tests, `sekisho.example.toml`, README |
-   | docs/templates/Skills | syntax, links or commands where practical |
-
-3. Before ship-level handoff, use the repository Make targets for the normal
-   gates unless the user explicitly requested a narrower check:
-
-   ```bash
-   make update
-   make validate
-   make test
-   make test-integration
-   ```
-
-   The Makefile is the source of truth for the command; do not ask an agent to
-   reproduce it from prose. `make all` is `cargo build --all-targets --locked`.
-   Complete when every applicable local gate has a result.
-4. Keep service-dependent tests ignored unless prerequisites and credentials
-   are intentionally available. Never print secrets or persist live provider
-   payloads. Complete when skipped checks name both the reason and residual
-   risk.
-5. Review failures against the changed scope. Report pre-existing failures with
-   evidence; do not relabel a failure as pre-existing without comparison.
-
-## Output
-
-Report:
-
-- commands run and pass/fail result;
-- focused behavior covered;
-- checks skipped with reasons;
-- failures and whether they block the stated outcome; and
-- remaining uncertainty.
-
-Never use “all tests pass” unless all stated tests actually ran and passed.
-
-## Relationship to autoreview
-
-`verify-change` is **deterministic** local evidence only. It does **not** replace
-structured second-model review. For non-trivial code that will be committed or
-opened as a PR, run the **shared** `autoreview` helper after verify-change and
-before ship (see `AGENTS.md` “Agent delivery closeout” and
-`deliver-ready-issue`). Do not vendor that skill into this repository.
+Keep shared fixes and instructions upstream in `Sannrox/agent-kit`. When the stub template
+changes upstream, run `bash scripts/validate-workflow-skills.sh --render`. Do not add
+repository-local helpers or copies.
