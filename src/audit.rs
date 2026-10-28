@@ -49,6 +49,10 @@ pub struct CallEvent {
     /// Guardrail summary (direction, action, rule names; never payload, #10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guardrail: Option<String>,
+    /// Approval gate for a marked tool (#21): `engine` when forwarded for the
+    /// engine to park and decide, `required` when refused for lack of a route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
     pub latency_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
@@ -257,6 +261,7 @@ mod tests {
             decision: Decision::Allowed,
             reason: None,
             guardrail: None,
+            approval: None,
             latency_ms: 1,
             response_bytes: None,
         }

@@ -260,6 +260,7 @@ impl Stack {
         .guardrails(sekisho::guardrails::Guardrails::new(
             config.guardrails.clone(),
         ))
+        .approvals(config.approvals.clone())
         .limits(sekisho::limits::Limiter::from_config(
             config.limits.clone(),
             config.cluster.state_dir.as_deref(),

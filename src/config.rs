@@ -39,6 +39,9 @@ pub struct Config {
     /// Runtime guardrails for tool arguments and results (#10).
     #[serde(default)]
     pub guardrails: crate::guardrails::GuardrailsConfig,
+    /// Approval gate for destructive and open-world tools (#21).
+    #[serde(default)]
+    pub approvals: crate::approvals::ApprovalsConfig,
     /// Shared replica state. Empty keeps rate limits in-process.
     #[serde(default)]
     pub cluster: ClusterConfig,
@@ -236,6 +239,7 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         self.limits.validate().map_err(ConfigError::Invalid)?;
+        self.approvals.validate().map_err(ConfigError::Invalid)?;
         if self.mcp.resource.trim().is_empty() || self.mcp.authorization_servers.is_empty() {
             return Err(ConfigError::Invalid(
                 "mcp needs a resource URL and at least one authorization server".into(),

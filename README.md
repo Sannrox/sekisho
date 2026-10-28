@@ -67,9 +67,20 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   flock; a store error fails closed with a 1s retry. MCP sessions are
   already stateless (2026-07-28); registry, policy and audit stay files.
   Audit lines are fsynced before the response.
+- **Approval gate.** Tools listed in `[approvals] marked` (destructive or
+  open-world, by registry key) are forwarded only along an approval route. A
+  marked tool also listed in `engine` goes to an upstream that parks and
+  decides the call as a governed Action, so the engine's parking is the
+  approval and Sekisho does not prompt again. A marked tool without a route
+  is refused before any delegated token is minted, so a missing or mistyped
+  route fails closed; an `engine` entry that is not marked fails config
+  load. Unmarked tools are unchanged. The audit line records the gate as
+  `approval`: `engine` or `required`. A caller-supplied park id is not
+  accepted yet: checking one needs a control-plane client.
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
-  `failed`), reason, latency, response size and trace id. Events never carry
+  `failed`, `throttled`), reason, guardrail and approval summaries, latency,
+  response size and trace id. Events never carry
   tokens, arguments or results. The trace id comes from the caller's W3C
   `traceparent`, or is generated, and the upstream call carries it in a new
   `traceparent` span so engine receipts link back. `/metrics` counts calls
