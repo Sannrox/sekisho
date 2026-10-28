@@ -1,43 +1,25 @@
 ---
 name: assess-change-impact
-description: Assess a proposed or implemented sekisho change across MCP, identity, registry, limits, and operations boundaries. Use when scoping an Issue, planning tests, reviewing a diff, or identifying documentation, compatibility, and security obligations.
+description: Assess a proposed or implemented change across trust, API, dependency, and operations boundaries. Use when scoping an Issue, planning tests, reviewing a diff, or identifying compatibility, documentation, and security obligations. Uses the shared Sannrox agent-kit installation.
 ---
 
 # Assess Change Impact
 
-Build an evidence-backed impact map before implementation or review.
+Use the canonical [assess-change-impact skill](https://github.com/Sannrox/agent-kit/tree/main/skills/assess-change-impact).
+Read the complete installed `~/.agents/agent-kit/skills/assess-change-impact/SKILL.md` and the
+references it requires before starting. If installed at another operator-selected location
+(`$AGENT_KIT_HOME`), use that installation. This repository entrypoint contains no
+workflow implementation.
 
-## Procedure
+If the skill is missing, run `bash scripts/validate-workflow-skills.sh` from this repository
+(it clones or updates the kit), or clone it directly:
+`git clone https://github.com/Sannrox/agent-kit ~/.agents/agent-kit`. Run `git pull` in that
+checkout to get the latest version; consumers always use `main`.
 
-1. Read the linked Issue or request, `VISION.md`, `README.md`, and the
-   relevant code. For a diff, inspect every changed file and its direct
-   callers or implementors. Complete when the claimed outcome and actual change
-   surface are both known.
-2. Trace applicable boundaries:
-   - MCP Streamable HTTP contract versus registry, policy and audit files;
-   - JWKS-file verifier versus per-call token exchange;
-   - in-process rate limits versus the cluster file store;
-   - guardrail layers (default, tenant, agent, tool);
-   - configuration, CLI, metrics, diagnostics, and the Containerfile image.
-   Complete when each applicable boundary has an owner and expected invariant.
-3. Identify compatibility obligations. Include old clients and configuration,
-   error semantics, and fail-closed paths (missing policy, failed exchange,
-   store errors). Complete when partial-failure paths are accounted for.
-4. Map evidence to risk: unit tests for pure logic; integration tests under
-   `tests/` for MCP and multi-component behavior; focused tests for config
-   parsing. Complete when every material risk has a proposed check or an
-   explicit residual uncertainty.
-5. Determine durable artifacts that must change: README, example config, an
-   Issue comment, or a repository Skill. Complete when no artifact is
-   proposed merely to record temporary planning.
+Run the shared skill's scripts from the repository being changed, preserving its working
+directory. Follow this repository's `AGENTS.md` (including `## Agent skill profile`) in addition to the
+canonical skill.
 
-## Output
-
-Return a compact matrix with columns:
-
-| Surface | Evidence found | Required change/check | Risk if missed |
-| --- | --- | --- | --- |
-
-Then list scope boundaries, blocking questions, and the smallest safe PR split.
-Do not approve an architecture, perform a full security audit, or claim
-behavior without inspecting the implementations.
+Keep shared fixes and instructions upstream in `Sannrox/agent-kit`. When the stub template
+changes upstream, run `bash scripts/validate-workflow-skills.sh --render`. Do not add
+repository-local helpers or copies.
