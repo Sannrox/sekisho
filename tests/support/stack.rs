@@ -421,6 +421,18 @@ impl Stack {
         extra: serde_json::Value,
         headers: std::collections::HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
     ) -> RunningService<RoleClient, ClientConfig> {
+        self.try_client_on_with(address, extra, headers)
+            .await
+            .unwrap()
+    }
+
+    /// Like [`Self::client_on_with`], returning why a connection failed.
+    pub async fn try_client_on_with(
+        &self,
+        address: &str,
+        extra: serde_json::Value,
+        headers: std::collections::HashMap<axum::http::HeaderName, axum::http::HeaderValue>,
+    ) -> Result<RunningService<RoleClient, ClientConfig>, String> {
         let bearer = token("k1", &key(1), claims(extra));
         ClientConfig::default()
             .serve(StreamableHttpClientTransport::from_config(
@@ -429,7 +441,7 @@ impl Stack {
                     .custom_headers(headers),
             ))
             .await
-            .unwrap()
+            .map_err(|error| error.to_string())
     }
 
     /// Wait for the first refresh, then enable `tools.echo` as `owner-1`.
