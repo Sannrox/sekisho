@@ -77,9 +77,53 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   load. Unmarked tools are unchanged. The audit line records the gate as
   `approval`: `engine` or `required`. A caller-supplied park id is not
   accepted yet: checking one needs a control-plane client.
+- **Mitigations.** An operator can disable a tool (`--tool <upstream>.<tool>`)
+  or a whole upstream (`--upstream`) for every caller, one tenant
+  (`--tenant`, the `tenant_id` claim) or one agent (`--agent`), or deny an
+  outbound destination (`--destination scheme://host[:port]`), with an
+  optional `--expires-in-secs`. Each apply and lift names a decision
+  reference that a pluggable decision verifier must accept; the standalone
+  verifier accepts any reference of 1 to 128 `A-Z a-z 0-9 . _ : / # -` from
+  a named operator. A rejected decision changes nothing and is audited as
+  `refuse`. Mitigations live in `[mitigations] file` and `audit_file`,
+  which every replica must share. Unset, both default into `[cluster]
+  state_dir` (`mitigations.json`, `mitigations-audit.jsonl`) when a cluster
+  is configured, and next to the config file otherwise; an explicit path
+  wins and resolves against the config file. Like the rate-limit buckets,
+  the store needs a filesystem whose exclusive locks all replicas see;
+  changes are serialized under a lock and replace the file atomically, and
+  every forwarded call reads it, so a change applies to the next call on
+  every replica without a restart. A mitigated call is refused before the
+  token exchange and audited as `denied` with the decision in
+  `mitigation`. A store that cannot be read or parsed refuses every
+  forwarded call. Expiry is checked from the stored time on each call; the
+  first call after it removes the mitigation and audits `expire` once.
+  Apply, lift, expire and refuse are appended to `[mitigations] audit_file`,
+  linked to the decision. A change and its audit events are written to the
+  store file together in one atomic replace, then appended to the log; an
+  append interrupted by a crash is completed by the next write, without
+  duplicates, so the log records only committed changes. Applying the same
+  decision to the same target and scope again while it is active, or
+  lifting one already gone, changes nothing; a different expiry needs a new
+  decision. Destinations
+  match the origin a call is forwarded to (the upstream `url`): scheme and
+  host lowercased, internationalized names in ASCII form, IP literals
+  canonical, a trailing dot dropped, the port explicit (80 or 443 by
+  default). Hosts are compared as written, without DNS, so a name and its
+  address are different destinations; a deny entry with a path, query or
+  user info is rejected. Replicas of earlier releases do not read
+  mitigations: upgrade every replica before relying on them.
+
+  ```sh
+  sekisho --config sekisho.toml mitigation apply --tool ontology.search --agent assistant-7 \
+    --decision INC-42 --operator alice --expires-in-secs 3600   # prints the id
+  sekisho --config sekisho.toml mitigation list
+  sekisho --config sekisho.toml mitigation lift <id> --decision INC-42-close --operator alice
+  ```
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
-  `failed`, `throttled`), reason, guardrail and approval summaries, latency,
+  `failed`, `throttled`), reason, guardrail and approval summaries, the
+  refusing mitigation's decision, latency,
   response size and trace id. Events never carry
   tokens, arguments or results. The trace id comes from the caller's W3C
   `traceparent`, or is generated, and the upstream call carries it in a new

@@ -16,6 +16,7 @@ pub mod gateway;
 pub mod guardrails;
 pub mod limits;
 pub mod metrics;
+pub mod mitigations;
 pub mod policy;
 pub mod registry;
 pub mod server;

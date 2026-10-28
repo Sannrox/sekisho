@@ -42,6 +42,9 @@ pub struct Config {
     /// Approval gate for destructive and open-world tools (#21).
     #[serde(default)]
     pub approvals: crate::approvals::ApprovalsConfig,
+    /// Disabled tools and upstreams and denied destinations (#42).
+    #[serde(default)]
+    pub mitigations: crate::mitigations::MitigationsConfig,
     /// Shared replica state. Empty keeps rate limits in-process.
     #[serde(default)]
     pub cluster: ClusterConfig,
@@ -111,7 +114,8 @@ impl Default for PolicyConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
-    /// Directory of the shared rate-limit file. MCP sessions are already
+    /// Directory of the shared rate-limit file, and of the mitigation store
+    /// unless `[mitigations]` names its files. MCP sessions are already
     /// stateless; registry, policy and audit are already files. Replicas
     /// point at the same paths.
     #[serde(default)]
@@ -225,6 +229,9 @@ impl Config {
         if let Some(state_dir) = &mut config.cluster.state_dir {
             *state_dir = base.join(&*state_dir);
         }
+        config
+            .mitigations
+            .resolve(base, config.cluster.state_dir.as_deref());
         if let Some(exchange) = &mut config.exchange {
             exchange.client_secret_file = base.join(&exchange.client_secret_file);
         }
