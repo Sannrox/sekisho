@@ -42,8 +42,13 @@ client_secret_file = "exchange-secret"
 [audit]
 calls_file = "calls.jsonl"             # one line per tool call: caller, agent, tool, decision, trace id
 
+# [mitigations]                       # edit with `sekisho mitigation`; every replica must share these
+# file = "mitigations.json"           # default: in [cluster] state_dir when set, else next to this file
+# audit_file = "mitigations-audit.jsonl" # apply, lift, expire and refused decisions; same default
+
 # [cluster]
-# state_dir = "cluster"                # shared rate-limit file; replicas point here
+# state_dir = "cluster"                # shared rate-limit and mitigation files; replicas point here
+                                       # needs a filesystem with exclusive locks shared by all replicas
 
 [limits]                               # defaults shown
 agent = { rate_per_sec = 10.0, burst = 20.0 }

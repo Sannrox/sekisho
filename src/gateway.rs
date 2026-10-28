@@ -122,6 +122,7 @@ pub struct Gateway {
     limiter: Arc<Limiter>,
     guardrails: Arc<crate::guardrails::Guardrails>,
     approvals: Arc<crate::approvals::ApprovalsConfig>,
+    mitigations: Option<Arc<crate::mitigations::MitigationStore>>,
 }
 
 /// Why a call did not produce an upstream answer.
@@ -132,6 +133,8 @@ struct Refused {
     error: Box<McpError>,
     guardrail: Option<String>,
     approval: Option<&'static str>,
+    /// Decision reference of the refusing mitigation (#42).
+    mitigation: Option<String>,
 }
 
 impl Refused {
@@ -145,6 +148,7 @@ impl Refused {
             )),
             guardrail: None,
             approval: None,
+            mitigation: None,
         }
     }
 
@@ -159,6 +163,21 @@ impl Refused {
         }
     }
 
+    /// Refused by an active mitigation (#42). The agent learns what is
+    /// disabled; the audit also names the decision.
+    fn mitigated(tool: &str, mitigation: &crate::mitigations::Mitigation) -> Self {
+        let what = match &mitigation.target {
+            crate::mitigations::Target::Tool { .. } => "tool is disabled",
+            crate::mitigations::Target::Upstream { .. } => "upstream is disabled",
+            crate::mitigations::Target::Destination { .. } => "destination is denied",
+        };
+        Self {
+            reason: format!("mitigated: {what} by decision {}", mitigation.decision),
+            mitigation: Some(mitigation.decision.clone()),
+            ..Self::denied(tool, &format!("mitigated: {what}"))
+        }
+    }
+
     fn failed(reason: &str, error: McpError) -> Self {
         Self {
             decision: Decision::Failed,
@@ -166,6 +185,7 @@ impl Refused {
             error: Box::new(error),
             guardrail: None,
             approval: None,
+            mitigation: None,
         }
     }
 
@@ -180,6 +200,7 @@ impl Refused {
             )),
             guardrail: Some(summary),
             approval: None,
+            mitigation: None,
         }
     }
 }
@@ -202,12 +223,20 @@ impl Gateway {
             limiter: Arc::new(Limiter::new(LimitsConfig::default())),
             guardrails: Arc::new(crate::guardrails::Guardrails::default()),
             approvals: Arc::new(crate::approvals::ApprovalsConfig::default()),
+            mitigations: None,
         }
     }
 
     /// Approval gate for destructive and open-world tools (#21).
     pub fn approvals(mut self, approvals: crate::approvals::ApprovalsConfig) -> Self {
         self.approvals = Arc::new(approvals);
+        self
+    }
+
+    /// Mitigations checked before every forward (#42). Without a store no
+    /// mitigation applies.
+    pub fn mitigations(mut self, store: crate::mitigations::MitigationStore) -> Self {
+        self.mitigations = Some(Arc::new(store));
         self
     }
 
@@ -288,6 +317,7 @@ impl Gateway {
                 error: Box::new(error),
                 guardrail: None,
                 approval: None,
+                mitigation: None,
             })?
             .ok_or_else(|| Refused::denied(&tool, "agent has no policy"))?;
         // Every call is charged, including meta-tools and calls the
@@ -331,6 +361,7 @@ impl Gateway {
                 )),
                 guardrail: None,
                 approval: None,
+                mitigation: None,
             });
         }
         if let Some(reason) = invalid_invoke {
@@ -383,6 +414,39 @@ impl Gateway {
             .iter()
             .find(|upstream| upstream.name == entry.upstream)
             .ok_or_else(|| Refused::denied(&tool, "tool upstream is not configured"))?;
+        // Mitigations (#42): the shared store is read on every forwarded call,
+        // so a change from any replica applies to the next one. A store that
+        // cannot be read refuses the call.
+        if let Some(store) = &self.mitigations {
+            let store = Arc::clone(store);
+            let (key, upstream_name, url) =
+                (tool.clone(), entry.upstream.clone(), upstream.url.clone());
+            let (agent_id, tenant) = (agent.id.clone(), principal.tenant.clone());
+            let checked = tokio::task::spawn_blocking(move || {
+                let call = crate::mitigations::Call {
+                    tool: &key,
+                    upstream: &upstream_name,
+                    url: &url,
+                    agent: &agent_id,
+                    tenant: tenant.as_deref(),
+                };
+                store.check(&call, crate::mitigations::now_ms())
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(crate::mitigations::MitigationError::Invalid(
+                    error.to_string(),
+                ))
+            });
+            match checked {
+                Ok(None) => {}
+                Ok(Some(mitigation)) => return Err(Refused::mitigated(&tool, &mitigation)),
+                Err(error) => {
+                    eprintln!("{error}");
+                    return Err(Refused::denied(&tool, "mitigation state is unavailable"));
+                }
+            }
+        }
         // Guardrails (#10): screen arguments before they leave, then the
         // result before it reaches the agent. Summaries name rules only.
         let guardrail_policy = self.guardrails.policy_for(
@@ -728,13 +792,14 @@ impl ServerHandler for Gateway {
                 invalid_invoke,
             )
             .await;
-        let (decision, reason, response_bytes, guardrail, approval) = match &outcome {
+        let (decision, reason, response_bytes, guardrail, approval, mitigation) = match &outcome {
             Ok((_, size, summary, approval)) => (
                 Decision::Allowed,
                 None,
                 Some(*size),
                 summary.clone(),
                 *approval,
+                None,
             ),
             Err(refused) => (
                 refused.decision,
@@ -742,6 +807,7 @@ impl ServerHandler for Gateway {
                 None,
                 refused.guardrail.clone(),
                 refused.approval,
+                refused.mitigation.clone(),
             ),
         };
         self.metrics.record_call(decision);
@@ -766,6 +832,7 @@ impl ServerHandler for Gateway {
             reason,
             guardrail,
             approval: approval.map(str::to_string),
+            mitigation,
             latency_ms: started.elapsed().as_millis(),
             response_bytes,
         };

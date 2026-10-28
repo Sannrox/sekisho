@@ -1,5 +1,6 @@
 //! `sekisho serve` runs the gateway; `sekisho registry` edits the tool
-//! registry; `sekisho diagnostics` prints a support bundle.
+//! registry; `sekisho mitigation` applies and lifts mitigations;
+//! `sekisho diagnostics` prints a support bundle.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +39,58 @@ enum Command {
         #[command(subcommand)]
         command: RegistryCommand,
     },
+    /// Disable a tool or upstream, or deny a destination, under a decision
+    /// reference. Changes are audited and apply to the next call on every
+    /// replica.
+    Mitigation {
+        #[command(subcommand)]
+        command: MitigationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MitigationCommand {
+    /// Print stored mitigations as JSON, by id.
+    List,
+    /// Apply a mitigation; prints its id.
+    Apply {
+        #[command(flatten)]
+        target: TargetArgs,
+        /// Limit to one tenant (`tenant_id` claim).
+        #[arg(long, conflicts_with = "agent")]
+        tenant: Option<String>,
+        /// Limit to one agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Lift automatically after this many seconds.
+        #[arg(long)]
+        expires_in_secs: Option<u64>,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        operator: String,
+    },
+    /// Lift a mitigation by id.
+    Lift {
+        id: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        operator: String,
+    },
+}
+
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct TargetArgs {
+    /// Registry key `<upstream>.<tool>`.
+    #[arg(long)]
+    tool: Option<String>,
+    #[arg(long)]
+    upstream: Option<String>,
+    /// `scheme://host[:port]` an upstream is reached at.
+    #[arg(long)]
+    destination: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -82,7 +135,64 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Registry { command } => registry_command(&config, command),
+        Command::Mitigation { command } => mitigation_command(&config, command),
     }
+}
+
+fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()> {
+    use sekisho::mitigations::{
+        Mitigation, MitigationStore, Outcome, Scope, Standalone, Target, now_ms,
+    };
+    let store = MitigationStore::new(&config.mitigations);
+    let now = now_ms();
+    let outcome = match command {
+        MitigationCommand::List => {
+            let state = store.load()?;
+            println!("{}", serde_json::to_string_pretty(&state)?);
+            return Ok(());
+        }
+        MitigationCommand::Apply {
+            target,
+            tenant,
+            agent,
+            expires_in_secs,
+            decision,
+            operator,
+        } => {
+            let target = match (target.tool, target.upstream, target.destination) {
+                (Some(tool), _, _) => Target::Tool { tool },
+                (_, Some(upstream), _) => Target::Upstream { upstream },
+                (_, _, Some(destination)) => Target::Destination { destination },
+                _ => unreachable!("clap requires one target"),
+            };
+            let scope = match (tenant, agent) {
+                (Some(tenant), _) => Scope::Tenant { tenant },
+                (_, Some(agent)) => Scope::Agent { agent },
+                _ => Scope::All,
+            };
+            let mitigation = Mitigation {
+                decision,
+                operator,
+                target,
+                scope,
+                applied_at_unix_ms: now,
+                expires_at_unix_ms: expires_in_secs
+                    .map(|secs| now.saturating_add(secs.saturating_mul(1_000))),
+            };
+            let (id, outcome) = store.apply(&Standalone, mitigation, now)?;
+            println!("{id}");
+            outcome
+        }
+        MitigationCommand::Lift {
+            id,
+            decision,
+            operator,
+        } => store.lift(&Standalone, &id, &decision, &operator, now)?,
+    };
+    if outcome == Outcome::Unchanged {
+        eprintln!("unchanged");
+    }
+    Ok(())
 }
 
 fn registry_command(config: &Config, command: RegistryCommand) -> Result<()> {
@@ -174,6 +284,9 @@ async fn serve(config: &Config) -> Result<()> {
         config.guardrails.clone(),
     ))
     .approvals(config.approvals.clone())
+    .mitigations(sekisho::mitigations::MitigationStore::new(
+        &config.mitigations,
+    ))
     .limits(sekisho::limits::Limiter::from_config(
         config.limits.clone(),
         config.cluster.state_dir.as_deref(),

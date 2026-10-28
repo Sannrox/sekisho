@@ -261,6 +261,9 @@ impl Stack {
             config.guardrails.clone(),
         ))
         .approvals(config.approvals.clone())
+        .mitigations(sekisho::mitigations::MitigationStore::new(
+            &config.mitigations,
+        ))
         .limits(sekisho::limits::Limiter::from_config(
             config.limits.clone(),
             config.cluster.state_dir.as_deref(),
@@ -283,10 +286,16 @@ impl Stack {
 
     /// Another replica sharing this stack's files.
     pub async fn extra_gateway(&self) -> Replica {
+        self.replica(&self.config).await
+    }
+
+    /// A replica serving `config`, for example one loaded from another
+    /// directory that points at this stack's shared files.
+    pub async fn replica(&self, config: &Config) -> Replica {
         let stop = CancellationToken::new();
         let federation = Arc::new(Federation::new(
-            self.config.upstreams.clone(),
-            self.config.registry.file.clone(),
+            config.upstreams.clone(),
+            config.registry.file.clone(),
         ));
         federation.refresh().await.unwrap();
         tokio::spawn(
@@ -295,25 +304,29 @@ impl Stack {
                 .run(Duration::from_millis(100), stop.clone()),
         );
         let state = Arc::new(AppState {
-            verifier: Verifier::from_config(&self.config.verifier).unwrap(),
+            verifier: Verifier::from_config(&config.verifier).unwrap(),
             metrics: Default::default(),
         });
         let gateway = sekisho::gateway::Gateway::new(
             federation,
-            self.config.policy.clone(),
-            sekisho::exchange::Exchanger::new(self.config.exchange.clone()),
-            sekisho::audit::CallAudit::new(self.config.audit.calls_file.clone())
-                .readers(self.config.audit.readers.clone()),
+            config.policy.clone(),
+            sekisho::exchange::Exchanger::new(config.exchange.clone()),
+            sekisho::audit::CallAudit::new(config.audit.calls_file.clone())
+                .readers(config.audit.readers.clone()),
             Default::default(),
         )
         .guardrails(sekisho::guardrails::Guardrails::new(
-            self.config.guardrails.clone(),
+            config.guardrails.clone(),
+        ))
+        .approvals(config.approvals.clone())
+        .mitigations(sekisho::mitigations::MitigationStore::new(
+            &config.mitigations,
         ))
         .limits(sekisho::limits::Limiter::from_config(
-            self.config.limits.clone(),
-            self.config.cluster.state_dir.as_deref(),
+            config.limits.clone(),
+            config.cluster.state_dir.as_deref(),
         ));
-        let app = router(state, &self.config.mcp, gateway, stop.clone());
+        let app = router(state, &config.mcp, gateway, stop.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {

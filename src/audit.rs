@@ -53,6 +53,9 @@ pub struct CallEvent {
     /// engine to park and decide, `required` when refused for lack of a route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    /// Decision reference of the mitigation that refused the call (#42).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mitigation: Option<String>,
     pub latency_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
@@ -262,6 +265,7 @@ mod tests {
             reason: None,
             guardrail: None,
             approval: None,
+            mitigation: None,
             latency_ms: 1,
             response_bytes: None,
         }
