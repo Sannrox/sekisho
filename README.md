@@ -280,6 +280,64 @@ sekisho --config sekisho.toml diagnostics > bundle.json
 - **Delivery.** `Containerfile` builds the release image. Deploy it by
   digest, not by tag.
 
+## High availability
+
+With the PostgreSQL backend, replicas are stateless replicas: every store
+lives in the database, so any surviving replica takes over a lost one's
+traffic with nothing to hand over. Clients retry on another replica. This
+is availability of the gateway; restarting or restoring the database is
+recovery, not availability.
+
+Stated bounds:
+
+- A call waits at most 5 s on the database before forwarding, and 5 s more
+  for a forwarded call's outcome, then fails closed.
+- An owner's registry edit reaches every replica within about 1 s; policy
+  and mitigation changes apply to the next call. A replica that has not
+  loaded the registry for 5 s serves no tools and is not ready.
+- Rate limits are serialized in the database; the only error is
+  `rate_per_sec ×` the clock skew between replicas.
+
+Drill evidence (`tests/kill_drill.rs`, run with the `postgres` feature and
+`SEKISHO_TEST_POSTGRES_URL`): two `sekisho` processes with separate working
+directories and no shared local file, on one PostgreSQL, under steady load
+at twice the rate limit, behind a client that retries on the survivor; one
+process is killed with SIGKILL. Over six local runs:
+
+- Interruption window (kill to first successful retry): 11 to 125 ms.
+- Acknowledged-data-loss bound: zero. Every call acknowledged to a client
+  had its `started` and outcome audit events in PostgreSQL; the in-flight
+  call on the killed process failed with a connection error, not a wrong
+  answer.
+- Rate limit held across the failover: 68 to 69 calls reached the upstream
+  (the killed in-flight one included) against `burst + rate × load time`
+  plus one call of slack, 71.3. A limiter that lost its state on failover
+  would admit up to another burst (10) and fail the drill.
+- The killed process rejoined after a restart (`/readyz` 200).
+
+Two cases are not retried safely, because the upstream may already have
+acted:
+
+- a forwarded call whose outcome event cannot be written fails without a
+  retry hint and names its call id;
+- a connection that drops before the response arrives (a replica killed
+  mid-call, as in the drill) gives the client no answer at all.
+
+Retry automatically on another replica only when the response carries a
+retry hint, or when the tool is idempotent or deduplicated. Otherwise check
+the call's audit events before repeating it. The drill's tool is a
+read-only echo, so it cannot show a repeated side effect.
+
+One PostgreSQL instance moves the single point of failure from the gateway
+to the database; it does not remove it. Removing it needs a replicated
+database with measured failover, which Sekisho neither provides nor has
+tested. Remaining single points of failure:
+
+- the PostgreSQL instance (an outage refuses every call until it returns);
+- the token issuer that exchanges tokens per call;
+- each upstream MCP server;
+- the load balancer or client routing that sends traffic to the survivor.
+
 Status: early. See [VISION.md](VISION.md) for the roadmap and GitHub Issues for planned work.
 
 License: Apache-2.0.

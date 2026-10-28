@@ -4,6 +4,8 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod stack;
 
 use base64::Engine as _;
