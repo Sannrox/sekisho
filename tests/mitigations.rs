@@ -23,7 +23,7 @@ async fn started() -> (Stack, MitigationStore) {
     let stack = Stack::start(Some(AGENTS)).await;
     stack.enable_echo().await;
     stack.enable("tools.other").await;
-    let store = MitigationStore::new(&stack.config.mitigations);
+    let store = MitigationStore::new(sekisho::state::open(&stack.config));
     (stack, store)
 }
 
@@ -67,8 +67,8 @@ fn call_audit(stack: &Stack) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn mitigation_audit(store: &MitigationStore) -> Vec<MitigationEvent> {
-    std::fs::read_to_string(store.audit_file())
+fn mitigation_audit(stack: &Stack) -> Vec<MitigationEvent> {
+    std::fs::read_to_string(stack.config.mitigations.audit_file.as_ref().unwrap())
         .unwrap_or_default()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -148,7 +148,7 @@ async fn both_replicas_enforce_apply_and_lift_on_the_next_call() {
     assert_eq!(lifted, Outcome::Lifted);
     on_a.call_tool(echo_call("back")).await.unwrap();
     on_b.call_tool(echo_call("back")).await.unwrap();
-    let actions: Vec<Action> = mitigation_audit(&store).iter().map(|e| e.action).collect();
+    let actions: Vec<Action> = mitigation_audit(&stack).iter().map(|e| e.action).collect();
     assert_eq!(actions, [Action::Apply, Action::Lift]);
     let _ = on_a.cancel().await;
     let _ = on_b.cancel().await;
@@ -197,7 +197,7 @@ async fn an_expired_mitigation_stops_on_the_next_call_and_is_audited_once() {
 
     on_a.call_tool(echo_call("x")).await.unwrap();
     on_stack.call_tool(echo_call("x")).await.unwrap();
-    let expired = mitigation_audit(&store)
+    let expired = mitigation_audit(&stack)
         .into_iter()
         .filter(|event| event.action == Action::Expire)
         .collect::<Vec<_>>();
@@ -252,7 +252,7 @@ async fn replicas_configured_apart_share_the_store_in_state_dir() {
         .client_on(&b.address, serde_json::json!({ "act": "agent-7" }))
         .await;
     ready(&on_b).await;
-    MitigationStore::new(&stack.config.mitigations)
+    MitigationStore::new(sekisho::state::open(&stack.config))
         .apply(&Standalone, echo_disabled(Scope::All), now_ms())
         .unwrap();
     let error = on_b.call_tool(echo_call("x")).await.unwrap_err();

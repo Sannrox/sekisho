@@ -20,5 +20,6 @@ pub mod mitigations;
 pub mod policy;
 pub mod registry;
 pub mod server;
+pub mod state;
 pub mod upstream;
 pub mod verifier;

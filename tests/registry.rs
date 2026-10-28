@@ -15,6 +15,7 @@ const AGENTS: &str = "[[agents]]\nid = \"user-1\"\ntools = [\"tools.echo\"]\n";
 #[tokio::test(flavor = "multi_thread")]
 async fn tools_start_disabled_then_enable_approve_and_roll_back_without_restart() {
     let stack = Stack::start(Some(AGENTS)).await;
+    let store = sekisho::state::open(&stack.config);
     let (file, audit) = (
         stack.config.registry.file.clone(),
         stack.config.registry.audit_file.clone(),
@@ -56,7 +57,7 @@ async fn tools_start_disabled_then_enable_approve_and_roll_back_without_restart(
         .await
     );
     assert_eq!(served().await.as_deref(), Some("Echo v1"));
-    registry::owner_edit(&file, &audit, "owner-1", "approve", "tools.echo", |r| {
+    registry::owner_edit(store.as_ref(), "owner-1", "approve", "tools.echo", |r| {
         r.approve("tools.echo")
     })
     .unwrap();
@@ -65,7 +66,7 @@ async fn tools_start_disabled_then_enable_approve_and_roll_back_without_restart(
             == Some("Echo v2"))
         .await
     );
-    registry::owner_edit(&file, &audit, "owner-1", "rollback", "tools.echo", |r| {
+    registry::owner_edit(store.as_ref(), "owner-1", "rollback", "tools.echo", |r| {
         r.rollback("tools.echo")
     })
     .unwrap();
