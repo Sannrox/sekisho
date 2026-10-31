@@ -42,8 +42,8 @@ enum Command {
         command: RegistryCommand,
     },
     /// Disable a tool or upstream, or deny a destination, under a decision
-    /// reference. Changes are audited and apply to the next call on every
-    /// replica.
+    /// reference (standalone, or a decided control-plane Action). Changes
+    /// are audited and apply to the next call on every replica.
     Mitigation {
         #[command(subcommand)]
         command: MitigationCommand,
@@ -226,16 +226,17 @@ fn state_command(config: &Config, command: StateCommand) -> Result<()> {
 
 fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()> {
     use sekisho::mitigations::{
-        Mitigation, MitigationStore, Outcome, Scope, Standalone, Target, now_ms,
+        DecisionAuthority, Mitigation, MitigationStore, Outcome, Scope, Target, now_ms,
     };
     let store = MitigationStore::new(sekisho::state::open(config)?);
+    if let MitigationCommand::List = command {
+        println!("{}", serde_json::to_string_pretty(&store.load()?)?);
+        return Ok(());
+    }
+    let verifier = DecisionAuthority::from_config(&config.mitigations)?;
     let now = now_ms();
     let outcome = match command {
-        MitigationCommand::List => {
-            let state = store.load()?;
-            println!("{}", serde_json::to_string_pretty(&state)?);
-            return Ok(());
-        }
+        MitigationCommand::List => unreachable!("list returns above"),
         MitigationCommand::Apply {
             target,
             tenant,
@@ -264,7 +265,7 @@ fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()>
                 expires_at_unix_ms: expires_in_secs
                     .map(|secs| now.saturating_add(secs.saturating_mul(1_000))),
             };
-            let (id, outcome) = store.apply(&Standalone, mitigation, now)?;
+            let (id, outcome) = store.apply(&verifier, mitigation, now)?;
             println!("{id}");
             outcome
         }
@@ -272,7 +273,7 @@ fn mitigation_command(config: &Config, command: MitigationCommand) -> Result<()>
             id,
             decision,
             operator,
-        } => store.lift(&Standalone, &id, &decision, &operator, now)?,
+        } => store.lift(&verifier, &id, &decision, &operator, now)?,
     };
     if outcome == Outcome::Unchanged {
         eprintln!("unchanged");

@@ -113,3 +113,34 @@ fn diagnostics_never_echo_a_misconfigured_jwks_file() {
     );
     assert!(bundle.contains("not a JWKS document"), "{bundle}");
 }
+
+#[test]
+fn diagnostics_never_echo_a_control_plane_token() {
+    let fixture = Fixture::new();
+    let secret = "control-plane-token-do-not-print-8844";
+    fixture.write("token", "dev-token");
+    fixture.write("plane-token", secret);
+    let config = fixture.write(
+        "sekisho.toml",
+        &format!(
+            "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"token\"\n{MCP_SECTION}\n\
+             [mitigations.control_plane]\nendpoint = \"http://127.0.0.1:50080\"\n\
+             token_file = \"plane-token\"\nnamespace = \"acme\"\n"
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sekisho"))
+        .args(["diagnostics", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let bundle = String::from_utf8(output.stdout).unwrap();
+    assert!(!bundle.contains(secret), "{bundle}");
+    let bundle: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+    assert_eq!(
+        bundle["control_plane"]["endpoint"],
+        "http://127.0.0.1:50080"
+    );
+    assert_eq!(bundle["control_plane"]["namespace"], "acme");
+    assert!(bundle["control_plane"].get("token_file").is_none());
+}

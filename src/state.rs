@@ -497,6 +497,7 @@ impl Directory {
             mitigations: MitigationFiles::new(&crate::mitigations::MitigationsConfig {
                 file: Some(dir.join("mitigations.json")),
                 audit_file: Some(dir.join("mitigations-audit.jsonl")),
+                control_plane: None,
             }),
             probed: ProbeCache::default(),
         }
@@ -792,6 +793,7 @@ mod tests {
                 &crate::mitigations::MitigationsConfig {
                     file: Some(root.path().join("mitigations.json")),
                     audit_file: Some(logs.join("mitigations-audit.jsonl")),
+                    control_plane: None,
                 },
             ),
             ..Directory::in_dir(root.path())

@@ -20,7 +20,11 @@
 //! file is an empty store.
 //!
 //! Applying or lifting needs a decision reference that a [`DecisionVerifier`]
-//! accepts. A rejected decision changes nothing and is audited as `refuse`.
+//! accepts. Without a control plane the standalone verifier trusts a named
+//! operator. With `[mitigations.control_plane]` the gateway looks the Action
+//! up on the engine ([`crate::control_plane`]): it must be decided, of a
+//! mitigating-control kind, and name this mitigation's scope. A rejected
+//! decision changes nothing and is audited as `refuse`.
 //! Apply, lift and expiry are audited in `[mitigations] audit_file` through an
 //! outbox: a change writes the new state and its events (`pending_audit`)
 //! in one atomic rename, so both commit or neither does. The events are then
@@ -50,6 +54,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::control_plane::{ControlPlane, ControlPlaneConfig, ControlPlaneError};
 use crate::state::StateBackend;
 
 /// Where the mitigation store and its audit live. Every replica must reach
@@ -65,6 +70,9 @@ pub struct MitigationsConfig {
     /// Apply, lift, expiry and refusals, one JSON line each.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_file: Option<PathBuf>,
+    /// When set, apply and lift verify the decision against the engine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<ControlPlaneConfig>,
 }
 
 const FILE: &str = "mitigations.json";
@@ -82,6 +90,9 @@ impl MitigationsConfig {
         };
         self.file = Some(pick(&self.file, FILE));
         self.audit_file = Some(pick(&self.audit_file, AUDIT_FILE));
+        if let Some(control_plane) = &mut self.control_plane {
+            control_plane.resolve(base);
+        }
     }
 }
 
@@ -260,6 +271,39 @@ impl DecisionVerifier for Standalone {
             return Err("an operator must be named".into());
         }
         Ok(())
+    }
+}
+
+/// The verifier selected by config: standalone, or the engine.
+pub enum DecisionAuthority {
+    Standalone,
+    ControlPlane(ControlPlane),
+}
+
+impl DecisionAuthority {
+    pub fn from_config(config: &MitigationsConfig) -> Result<Self, ControlPlaneError> {
+        match &config.control_plane {
+            Some(control_plane) => Ok(Self::ControlPlane(ControlPlane::from_config(
+                control_plane,
+            )?)),
+            None => Ok(Self::Standalone),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::ControlPlane(_) => "control_plane",
+        }
+    }
+}
+
+impl DecisionVerifier for DecisionAuthority {
+    fn verify(&self, check: &DecisionCheck<'_>) -> Result<(), String> {
+        match self {
+            Self::Standalone => Standalone.verify(check),
+            Self::ControlPlane(plane) => plane.verify(check),
+        }
     }
 }
 
@@ -499,6 +543,10 @@ impl MitigationStore {
 
     /// Lift mitigation `id` once `verifier` accepts `decision`. Lifting one
     /// that is not stored (already lifted or expired) is `Unchanged`.
+    /// The stored entry is snapshotted and verified without the store lock,
+    /// then removed only if the same entry is still present, so a slow
+    /// control-plane lookup cannot stall other writers and a swap cannot
+    /// lift a different mitigation.
     pub fn lift(
         &self,
         verifier: &impl DecisionVerifier,
@@ -507,42 +555,39 @@ impl MitigationStore {
         operator: &str,
         now_ms: u64,
     ) -> Result<Outcome, MitigationError> {
-        // The entry is read, verified and removed under one lock, so another
-        // replica cannot swap it between the check and the removal.
-        let (mut outcome, mut refused) = (Outcome::Unchanged, None);
-        let edited = self.store.edit_mitigations(&mut |state| {
-            (outcome, refused) = (Outcome::Unchanged, None);
-            let Some(mitigation) = state.mitigations.remove(id) else {
-                return Ok(Commit::Changes(Vec::new()));
-            };
-            let check = DecisionCheck {
-                change: Change::Lift,
-                decision,
-                operator,
-                mitigation: &mitigation,
-            };
-            if let Err(reason) = verifier.verify(&check) {
-                let mut event = MitigationEvent::new(Action::Refuse, id, &mitigation, 0, now_ms);
-                event.lift_decision = Some(decision.into());
-                event.operator = Some(operator.into());
-                let event = refusal(event, &reason);
-                refused = Some(reason);
-                return Ok(Commit::Refusal(Box::new(event)));
+        let Some(mitigation) = self.load()?.mitigations.get(id).cloned() else {
+            return Ok(Outcome::Unchanged);
+        };
+        let check = DecisionCheck {
+            change: Change::Lift,
+            decision,
+            operator,
+            mitigation: &mitigation,
+        };
+        if let Err(reason) = verifier.verify(&check) {
+            let mut event = MitigationEvent::new(Action::Refuse, id, &mitigation, 0, now_ms);
+            event.lift_decision = Some(decision.into());
+            event.operator = Some(operator.into());
+            return Err(self.refuse(event, reason));
+        }
+        let mut outcome = Outcome::Unchanged;
+        self.store.edit_mitigations(&mut |state| {
+            match state.mitigations.get(id) {
+                Some(current) if current == &mitigation => {}
+                _ => {
+                    outcome = Outcome::Unchanged;
+                    return Ok(Commit::Changes(Vec::new()));
+                }
             }
+            state.mitigations.remove(id);
             let mut event =
                 MitigationEvent::new(Action::Lift, id, &mitigation, state.generation + 1, now_ms);
             event.lift_decision = Some(decision.into());
             event.operator = Some(operator.into());
             outcome = Outcome::Lifted;
             Ok(Commit::Changes(vec![event]))
-        });
-        if let Some(reason) = refused {
-            if let Err(error) = edited {
-                eprintln!("auditing a refused mitigation decision failed: {error}");
-            }
-            return Err(MitigationError::Refused(reason));
-        }
-        edited.map(|()| outcome)
+        })?;
+        Ok(outcome)
     }
 
     /// Remove and audit every mitigation expired at `now_ms`.
@@ -1211,9 +1256,12 @@ mod tests {
             std::thread::spawn(move || {
                 let _ = done.send(other.apply(&Standalone, replacement, 200));
             });
-            // Under the lock the replacement waits for this lift to finish.
-            let raced = finished.recv_timeout(std::time::Duration::from_millis(300));
-            assert!(raced.is_err(), "replaced while the lift was deciding");
+            // Verify is unlocked, so the replacement can land before this
+            // lift re-acquires the store.
+            let raced = finished
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("replacement should apply while the lift is deciding");
+            raced.expect("replacement apply");
             Ok(())
         }
     }
@@ -1240,24 +1288,17 @@ mod tests {
             replacement: replacement.clone(),
             inspected: Default::default(),
         };
-        store.lift(&racing, &id, "DEC-2", "ops-1", 200).unwrap();
+        assert_eq!(
+            store.lift(&racing, &id, "DEC-2", "ops-1", 200).unwrap(),
+            Outcome::Unchanged
+        );
         let inspected = racing.inspected.into_inner().unwrap();
-        let lifted = events(&dir)
-            .into_iter()
-            .rfind(|e| e.action == Action::Lift)
-            .unwrap();
         assert_eq!(inspected.expires_at_unix_ms, Some(100));
-        assert_eq!(lifted.expires_at_unix_ms, inspected.expires_at_unix_ms);
-        // The replacement lands after the lift and stays.
-        let mut stored = None;
-        for _ in 0..100 {
-            stored = store.load().unwrap().mitigations.remove(&id);
-            if stored.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let stored = stored.expect("replacement applied after the lift");
+        assert!(
+            events(&dir).into_iter().all(|e| e.action != Action::Lift),
+            "lifted a replacement that landed while verifying"
+        );
+        let stored = store.load().unwrap().mitigations.remove(&id).unwrap();
         assert_eq!(stored.operator, "ops-2");
     }
 

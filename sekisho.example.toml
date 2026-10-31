@@ -45,6 +45,11 @@ calls_file = "calls.jsonl"             # one line per tool call: caller, agent, 
 # [mitigations]                       # edit with `sekisho mitigation`; every replica must share these
 # file = "mitigations.json"           # default: in [cluster] state_dir when set, else next to this file
 # audit_file = "mitigations-audit.jsonl" # apply, lift, expire and refused decisions; same default
+# [mitigations.control_plane]         # platform mode: verify apply/lift against a decided Action
+# endpoint = "http://127.0.0.1:50080" # engine HTTP/JSON projection origin
+# token_file = "control-plane-token"  # bearer used to read Actions; never inlined
+# namespace = "acme"
+# timeout_ms = 5000
 
 # [cluster]
 # state_dir = "cluster"                # shared rate-limit and mitigation files; replicas point here
