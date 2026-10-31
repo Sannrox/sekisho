@@ -11,3 +11,4 @@ validate:
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -D warnings
 	cargo clippy --all-targets --locked --features postgres -- -D warnings
+	bash scripts/validate-release.sh
