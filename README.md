@@ -278,7 +278,8 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   kind, issuer, audience and key ids. It never includes tokens, key material
   or file contents.
 - **Delivery.** `Containerfile` builds the release image. Deploy it by
-  digest, not by tag.
+  digest, not by tag. There is no `latest` image tag. Signed `v*` tags
+  and GitHub Releases are described in [RELEASING.md](RELEASING.md).
 
 ## High availability
 

@@ -1,0 +1,175 @@
+name: Release
+
+# Tagged publishes only. Pull requests and workflow_dispatch dry-run: they
+# build artifacts and never mint attestations or a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "scripts/verify-release-tag.sh"
+      - "scripts/changelog-notes.py"
+      - "scripts/release-manifest.py"
+      - "scripts/release-sbom.py"
+      - "scripts/release-package.sh"
+      - "scripts/validate-release.sh"
+      - "scripts/changelog-draft.sh"
+      - "security/release-tag-key.asc"
+      - "security/release-tag-fingerprints"
+      - "RELEASING.md"
+      - "CHANGELOG.md"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "Containerfile"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: bash scripts/validate-release.sh
+
+  verify-tag:
+    name: Verify signed tag
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch annotated tag object
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+      - name: Verify annotated signed tag equals crate version
+        run: bash scripts/verify-release-tag.sh verify "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
+
+  package:
+    name: Package artifacts
+    runs-on: ubuntu-latest
+    needs: [scripts, verify-tag]
+    if: ${{ !cancelled() && needs.scripts.result == 'success' && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          extra=(--git-sha "${GITHUB_SHA}")
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            extra+=(--tag "${GITHUB_REF_NAME}" --with-images)
+          else
+            extra+=(--skip-test)
+          fi
+          bash scripts/release-package.sh --out dist "${extra[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sekisho-release
+          path: dist/
+          if-no-files-found: error
+
+  attest:
+    name: Attest artifacts
+    needs: package
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      attestation-url: ${{ steps.provenance.outputs.attestation-url }}
+      sbom-attestation-url: ${{ steps.sbom.outputs.attestation-url }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sekisho-release
+          path: dist
+      - name: Attest provenance
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/sekisho-[0-9]*
+            dist/*-image.tar
+            dist/SHA256SUMS
+            dist/sekisho.cdx.json
+      - name: Attest SBOM
+        id: sbom
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-path: |
+            dist/sekisho-[0-9]*
+            dist/*-image.tar
+            dist/SHA256SUMS
+          sbom-path: dist/sekisho.cdx.json
+
+  publish:
+    name: GitHub Release
+    needs: [package, attest]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sekisho-release
+          path: dist
+      - name: Record attestation URLs on the manifest
+        env:
+          PROVENANCE_URL: ${{ needs.attest.outputs.attestation-url }}
+          SBOM_URL: ${{ needs.attest.outputs.sbom-attestation-url }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path("dist/sekisho-release.json")
+          manifest = json.loads(path.read_text())
+          urls = [u for u in (os.environ.get("PROVENANCE_URL"), os.environ.get("SBOM_URL")) if u]
+          manifest["attestations"] = urls
+          path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          PY
+      - name: Notes from CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: python3 scripts/changelog-notes.py "${TAG#v}" > dist/RELEASE_NOTES.md
+      - name: Draft then publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --draft=false
+          else
+            gh release create "$TAG" dist/* \
+              --draft \
+              --verify-tag \
+              --title "$TAG" \
+              --notes-file dist/RELEASE_NOTES.md
+            gh release edit "$TAG" --draft=false
+          fi
+          echo "Published GitHub Release ${TAG} from CHANGELOG"
+          echo "Image tags: version only, never latest"

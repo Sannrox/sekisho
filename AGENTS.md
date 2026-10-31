@@ -13,8 +13,12 @@ before changing system boundaries.
 - `cargo clippy --all-targets --locked -- -D warnings` matches CI.
 - `make validate`, `make test` and `make test-integration` are the local gates.
   They match CI (`.github/workflows/ci.yml`): `cargo build --all-targets --locked`,
-  `cargo test --locked`, `cargo fmt --check`, and
-  `cargo clippy --all-targets --locked -- -D warnings`.
+  `cargo test --locked`, `cargo fmt --check`,
+  `cargo clippy --all-targets --locked -- -D warnings`, and
+  `bash scripts/validate-release.sh`.
+- `scripts/validate-release.sh` checks the tag-triggered release path: signed
+  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
+  Pull requests and dry runs must not publish or attest.
 
 GitHub Issues are the planning source of truth. The workflow Skills are the
 shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or
@@ -264,8 +268,8 @@ Feature: a new observable operator or integration outcome.
 - Read `VISION.md` with `README.md` when scoping or shaping work.
 - There is no `docs/decisions/` tree. If a durable boundary, trust model, or
   public contract needs an ADR, propose adding that tree in the same change.
-  Durable docs are `README.md`, `VISION.md`, `sekisho.example.toml`, and
-  `agents.example.toml`.
+  Durable docs are `README.md`, `VISION.md`, `RELEASING.md`,
+  `sekisho.example.toml`, and `agents.example.toml`.
 - Affected areas for Issues: mcp, registry, policy, exchange, limits,
   guardrails, audit, cluster.
 
@@ -301,6 +305,6 @@ Rows beyond `## Testing Guidelines`:
 - MCP, token-exchange, registry, and config compatibility;
 - configuration additions, removals, defaults, and `sekisho.example.toml`;
 - security, rollback, and operator actions;
-- `Containerfile` image packaging (deploy by digest);
+- `Containerfile` image packaging (deploy by digest, never a `latest` tag);
 - release notes drafted from the pull request bodies since the last tag with
   `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
