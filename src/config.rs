@@ -319,7 +319,11 @@ impl Config {
                 ))
             }
             _ => Ok(()),
+        }?;
+        if let Some(control_plane) = &self.mitigations.control_plane {
+            control_plane.validate().map_err(ConfigError::Invalid)?;
         }
+        Ok(())
     }
 }
 
@@ -350,5 +354,36 @@ mod tests {
             let error = loaded.unwrap_err().to_string();
             assert!(error.contains("postgres feature"), "{error}");
         }
+    }
+
+    #[test]
+    fn control_plane_config_resolves_the_token_file_and_rejects_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekisho.toml");
+        std::fs::write(
+            &path,
+            "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"t\"\n\
+             [mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://i\"]\n\
+             [mitigations.control_plane]\nendpoint = \"http://127.0.0.1:50080\"\n\
+             token_file = \"plane-token\"\nnamespace = \"acme\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        let plane = loaded.mitigations.control_plane.unwrap();
+        assert_eq!(plane.endpoint, "http://127.0.0.1:50080");
+        assert_eq!(plane.token_file, dir.path().join("plane-token"));
+        assert_eq!(plane.namespace, "acme");
+        assert_eq!(plane.timeout_ms, 5_000);
+
+        std::fs::write(
+            &path,
+            "listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"t\"\n\
+             [mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://i\"]\n\
+             [mitigations.control_plane]\nendpoint = \"http://127.0.0.1:50080/sekai.SekaiService/GetActionInstance\"\n\
+             token_file = \"plane-token\"\nnamespace = \"acme\"\n",
+        )
+        .unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("origin"), "{error}");
     }
 }

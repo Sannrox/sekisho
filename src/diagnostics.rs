@@ -6,7 +6,7 @@ use crate::config::{Config, VerifierConfig};
 use crate::verifier::Verifier;
 
 /// Configuration shape and verifier key ids. Static tokens, JWKS key
-/// material and file contents are never included.
+/// material, control-plane tokens and file contents are never included.
 #[derive(Debug, Serialize)]
 pub struct Bundle {
     pub version: &'static str,
@@ -14,6 +14,14 @@ pub struct Bundle {
     pub arch: &'static str,
     pub listen: String,
     pub verifier: VerifierSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_plane: Option<ControlPlaneSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlPlaneSummary {
+    pub endpoint: String,
+    pub namespace: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,5 +66,13 @@ pub fn collect(config: &Config) -> Bundle {
             status,
             key_ids,
         },
+        control_plane: config
+            .mitigations
+            .control_plane
+            .as_ref()
+            .map(|plane| ControlPlaneSummary {
+                endpoint: plane.endpoint.clone(),
+                namespace: plane.namespace.clone(),
+            }),
     }
 }

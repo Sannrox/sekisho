@@ -191,10 +191,19 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   (`--tenant`, the `tenant_id` claim) or one agent (`--agent`), or deny an
   outbound destination (`--destination scheme://host[:port]`), with an
   optional `--expires-in-secs`. Each apply and lift names a decision
-  reference that a pluggable decision verifier must accept; the standalone
-  verifier accepts any reference of 1 to 128 `A-Z a-z 0-9 . _ : / # -` from
-  a named operator. A rejected decision changes nothing and is audited as
-  `refuse`. Mitigations live in `[mitigations] file` and `audit_file`,
+  reference that a pluggable decision verifier must accept. Without
+  `[mitigations.control_plane]` the standalone verifier accepts any
+  reference of 1 to 128 `A-Z a-z 0-9 . _ : / # -` from a named operator.
+  With it, the gateway looks the Action up on the engine's HTTP/JSON
+  projection (`GetActionInstance`; a lift also reads the mitigation object).
+  The Action must be decided (`admitted`, granted if it parked), of type
+  `security.mitigation.apply` or `security.mitigation.lift`, and name this
+  mitigation's target (`gateway_tool_disable` for a tool or upstream,
+  `outbound_deny` for a destination). A tenant-scoped mitigation must match
+  the Action's namespace. The engine stays the source of truth for grants
+  and markings. Unreachable, unknown, parked, denied or mismatched
+  references are refused. A rejected decision changes nothing and is
+  audited as `refuse`. Mitigations live in `[mitigations] file` and `audit_file`,
   which every replica must share. Unset, both default into `[cluster]
   state_dir` (`mitigations.json`, `mitigations-audit.jsonl`) when a cluster
   is configured, and next to the config file otherwise; an explicit path
@@ -229,6 +238,9 @@ sekisho --config sekisho.toml diagnostics > bundle.json
   sekisho --config sekisho.toml mitigation list
   sekisho --config sekisho.toml mitigation lift <id> --decision INC-42-close --operator alice
   ```
+
+  In platform mode `--decision` is the Action instance id (or its
+  `operation_id`) of the decided apply or lift.
 - **Call audit.** Every tool call appends one JSON line to `[audit]
   calls_file`: subject, agent, tool, decision (`allowed`, `denied`,
   `failed`, `throttled`), call id, reason, guardrail and approval summaries, the
