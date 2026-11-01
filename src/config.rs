@@ -21,9 +21,47 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// The config schema version this release reads.
+pub const CONFIG_VERSION: u32 = 1;
+
+/// A config file's declared schema version. Omitted means
+/// [`CONFIG_VERSION`]; any other value is refused at load, so a file written
+/// for a newer schema never runs with its new settings ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ConfigVersion(u32);
+
+impl Default for ConfigVersion {
+    fn default() -> Self {
+        Self(CONFIG_VERSION)
+    }
+}
+
+impl ConfigVersion {
+    fn is_current(&self) -> bool {
+        self.0 == CONFIG_VERSION
+    }
+}
+
+impl<'de> Deserialize<'de> for ConfigVersion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match u32::deserialize(deserializer)? {
+            CONFIG_VERSION => Ok(Self(CONFIG_VERSION)),
+            other => Err(serde::de::Error::custom(format!(
+                "config version {other} is not supported; this release reads version {CONFIG_VERSION}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Schema version (`version = 1`). Omitted means the current version.
+    /// Not serialized when current, so written configs stay readable by the
+    /// previous release.
+    #[serde(default, skip_serializing_if = "ConfigVersion::is_current")]
+    version: ConfigVersion,
     /// Address to bind. Port 0 picks a free port; `serve` prints the bound one.
     pub listen: SocketAddr,
     pub verifier: VerifierConfig,
@@ -385,5 +423,27 @@ mod tests {
         .unwrap();
         let error = Config::load(&path).unwrap_err().to_string();
         assert!(error.contains("origin"), "{error}");
+    }
+
+    fn minimal(version_line: &str) -> String {
+        format!(
+            "{version_line}listen = \"127.0.0.1:0\"\n[verifier]\nkind = \"static\"\ntoken_file = \"t\"\n\
+             [mcp]\nresource = \"http://127.0.0.1/mcp\"\nauthorization_servers = [\"https://i\"]\n"
+        )
+    }
+
+    #[test]
+    fn config_version_defaults_to_current_and_unknown_versions_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekisho.toml");
+        for accepted in ["", "version = 1\n"] {
+            std::fs::write(&path, minimal(accepted)).unwrap();
+            Config::load(&path).unwrap_or_else(|error| panic!("{accepted:?}: {error}"));
+        }
+        for refused in ["version = 2\n", "version = 0\n"] {
+            std::fs::write(&path, minimal(refused)).unwrap();
+            let error = format!("{:?}", Config::load(&path).unwrap_err());
+            assert!(error.contains("is not supported"), "{refused:?}: {error}");
+        }
     }
 }
