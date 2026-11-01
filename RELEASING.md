@@ -6,6 +6,21 @@ Family versioning, tagging, and release policy:
 This page is sekisho-local: how a maintainer prepares and tags **this**
 repository.
 
+## Compatibility of config, CLI and JSON output
+
+- **Config.** `sekisho.toml` may declare `version = 1`; omitted means the
+  current version. A file declaring any other version is refused at load,
+  so settings written for a newer schema never run ignored. A change that
+  older files cannot express bumps the version in the same release as its
+  migration notes. Releases before this rule reject a `version` key, so omit
+  it if you may roll back to one.
+- **CLI.** A flag or command is removed only after one minor release that
+  still accepts it and prints a deprecation warning naming its replacement.
+- **JSON output.** Commands that print JSON (`diagnostics`,
+  `mitigation list`, `registry show`, and any added later) are an API:
+  fields are only added in a minor; removing or renaming one is a breaking
+  change listed under Breaking in `CHANGELOG.md`.
+
 ## Who cuts a tag
 
 Agents never push `v*` tags. After the version-bump pull request merges, the

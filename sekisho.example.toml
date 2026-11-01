@@ -1,4 +1,5 @@
 # Copy to sekisho.toml. Relative paths resolve from this file's directory.
+# version = 1                         # config schema; omitted means current
 listen = "127.0.0.1:8090"
 
 [verifier]
