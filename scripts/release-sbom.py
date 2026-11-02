@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -16,6 +17,10 @@ def cargo_metadata(root: Path) -> dict:
         text=True,
     )
     return json.loads(raw)
+
+
+def license_entry(raw: str) -> dict:
+    return {"expression": " OR ".join(part.strip() for part in raw.split("/"))}
 
 
 def bom_from_metadata(meta: dict) -> dict:
@@ -38,13 +43,13 @@ def bom_from_metadata(meta: dict) -> dict:
             "purl": purl,
         }
         if pkg.get("license"):
-            component["licenses"] = [{"license": {"id": pkg["license"]}}]
+            component["licenses"] = [license_entry(pkg["license"])]
         if pid not in workspace:
             components.append(component)
     if root_pkg is None:
         raise SystemExit("cargo metadata did not include package sekisho")
     root_purl = f"pkg:cargo/sekisho@{root_pkg['version']}"
-    return {
+    bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.5",
         "version": 1,
@@ -59,6 +64,10 @@ def bom_from_metadata(meta: dict) -> dict:
         },
         "components": sorted(components, key=lambda item: item["bom-ref"]),
     }
+
+    document = json.dumps(bom, sort_keys=True, separators=(",", ":"))
+    bom["serialNumber"] = uuid.uuid5(uuid.NAMESPACE_URL, document).urn
+    return bom
 
 
 def self_test() -> None:
@@ -83,6 +92,14 @@ def self_test() -> None:
     assert bom["bomFormat"] == "CycloneDX"
     assert bom["metadata"]["component"]["version"] == "0.0.0"
     assert bom["metadata"]["component"]["type"] == "application"
+    serial = bom["serialNumber"]
+    assert serial.startswith("urn:uuid:")
+    assert uuid.UUID(serial.removeprefix("urn:uuid:")).version == 5
+    assert bom_from_metadata(meta)["serialNumber"] == serial
+    meta["packages"][1]["version"] = "0.2.1"
+    assert bom_from_metadata(meta)["serialNumber"] != serial
+    assert bom["components"][0]["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
+    assert license_entry("MIT/Apache-2.0") == {"expression": "MIT OR Apache-2.0"}
     assert bom["components"][0]["name"] == "libc"
     print("release-sbom self-test passed")
 
