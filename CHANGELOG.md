@@ -10,8 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.0]
+## [0.1.0] - 2026-11-02
 
-Development crate version. No git tag yet. The crate is not on crates.io
-(`publish = false`). `Containerfile` builds the release image; deploy by
-digest, never by a `latest` tag.
+First release.
+
+### Added
+
+- Authenticated tool federation, registry approval and per-agent discovery and invocation policy.
+- Per-call token exchange, audience and scope restrictions, rate limits, approval gates and durable audit.
+- Outbound allowlists, credential injection, bounded responses, cancellation and diagnostics.
+- Directory state storage and an optional database backend, with explicit readiness and recovery behavior.
+
+### Upgrade
+
+- Initial tagged release; no earlier tagged configuration or API baseline exists.
+- Configure the issuer, token exchange and approved upstream tools before serving requests. Missing authorization or state remains fail-closed.
+- Back up the configured state before changing binaries. Directory replicas require shared locking semantics; independent local directories do not form a shared state store.

@@ -33,7 +33,7 @@ fi
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/sekisho-release-package.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "${tmp}/dist"
-printf 'fake\n' >"${tmp}/dist/sekisho-0.0.0-test"
+printf 'fake\n' >"${tmp}/dist/sekisho-0.1.0-test"
 ROOT_PATH="$ROOT_PATH" bash scripts/release-package.sh --out "${tmp}/dist" --skip-build --skip-test --skip-github --git-sha "$(git rev-parse HEAD)"
 [[ -f "${tmp}/dist/sekisho-release.json" ]] || fail "dry-run package did not write a manifest"
 [[ -f "${tmp}/dist/sekisho.cdx.json" ]] || fail "dry-run package did not write an SBOM"
@@ -42,8 +42,8 @@ python3 -c "import json,sys; m=json.loads(open(sys.argv[1]).read()); assert m['s
 
 notes_out="${tmp}/notes"
 mkdir -p "$notes_out"
-bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag v0.0.0 --git-sha "$(git rev-parse HEAD)"
+bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag v0.1.0 --git-sha "$(git rev-parse HEAD)"
 [[ -s "${notes_out}/RELEASE_NOTES.md" ]] || fail "tag dry-run did not write CHANGELOG notes"
-grep -F "Development crate version" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing expected 0.0.0 body"
+grep -F "First release" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing expected 0.1.0 body"
 
 printf 'validate-release passed\n'
