@@ -49,6 +49,21 @@ def self_test() -> None:
         assert "empty CHANGELOG section" in str(exc)
     else:
         raise SystemExit("expected empty-section failure")
+    # A pre-release has its own section; the final never reuses it.
+    rc = (
+        "# Changelog\n\n"
+        "## [0.3.0-rc.1] - 2026-11-04\n\n"
+        "- candidate\n\n"
+        "## [0.2.0] - 2026-10-30\n\n"
+        "- older\n"
+    )
+    assert notes_for(rc, "0.3.0-rc.1") == "- candidate"
+    try:
+        notes_for(rc, "0.3.0")
+    except SystemExit as exc:
+        assert "no ## [0.3.0] section" in str(exc)
+    else:
+        raise SystemExit("expected a final release to need its own section")
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "CHANGELOG.md"
         path.write_text(sample)

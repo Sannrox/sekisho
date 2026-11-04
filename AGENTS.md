@@ -16,9 +16,10 @@ before changing system boundaries.
   `cargo test --locked`, `cargo fmt --check`,
   `cargo clippy --all-targets --locked -- -D warnings`, and
   `bash scripts/validate-release.sh`.
-- `scripts/validate-release.sh` checks the tag-triggered release path: signed
-  annotated tags, CHANGELOG notes, SBOM, and the family release manifest.
-  Pull requests and dry runs must not publish or attest.
+- `scripts/validate-release.sh` checks the release path (a `v*` tag push
+  dispatches `release.yml` from main for that tag): signed annotated tags,
+  CHANGELOG notes, SBOM, and the family release manifest. Pull requests and
+  dry runs must not publish or attest.
 
 GitHub Issues are the planning source of truth. The workflow Skills are the
 shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or

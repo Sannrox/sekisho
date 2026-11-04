@@ -1,13 +1,14 @@
 name: Release
 
-# Tagged publishes only. Pull requests and workflow_dispatch dry-run: they
-# build artifacts and never mint attestations or a GitHub Release.
+# Runs from main for a signed tag. release-dispatch.yml starts it on a v* tag
+# push; a failed run is fixed on main and re-run for the same tag. Pull
+# requests and workflow_dispatch without a tag dry-run the packaging path and
+# never mint attestations or touch a GitHub Release.
 on:
-  push:
-    tags: ["v*"]
   pull_request:
     paths:
       - ".github/workflows/release.yml"
+      - ".github/workflows/release-dispatch.yml"
       - "scripts/verify-release-tag.sh"
       - "scripts/changelog-notes.py"
       - "scripts/release-manifest.py"
@@ -23,6 +24,17 @@ on:
       - "Cargo.lock"
       - "Containerfile"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed vX.Y.Z or vX.Y.Z-rc.N tag to release from main; empty for a dry run
+        required: false
+        default: ""
+        type: string
+
+# One run per tag. A second dispatch for the same tag waits for the first.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -31,50 +43,128 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  scripts:
-    name: Release scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-          fetch-tags: true
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - run: bash scripts/validate-release.sh
-
+  # Resolves the release commit every later job checks out. A tagged run must
+  # come from main: main's verify-release-tag.sh and allowed keys verify the
+  # signed tag against the tagged commit's Cargo.toml, and that commit must be
+  # on main. A dry run resolves the checked-out commit and verifies nothing.
   verify-tag:
     name: Verify signed tag
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Refuse a tagged run that is not from main
+        if: inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_REF" == refs/heads/main ]] || { echo "tagged release runs must start from refs/heads/main, not ${WORKFLOW_REF}" >&2; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$ ]] || { echo "invalid release tag: ${TAG}" >&2; exit 1; }
+      - name: Check out main's release-tag verifier
+        if: inputs.tag != ''
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: main-tree
+      - name: Check out the release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
+          path: source
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Verify the signed tag on main
+        if: inputs.tag != ''
+        working-directory: source
+        env:
+          TAG: ${{ inputs.tag }}
+          MAIN_TREE: ${{ github.workspace }}/main-tree
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" "+refs/heads/main:refs/remotes/origin/main"
+          sha="$(git rev-parse "${TAG}^{commit}")"
+          RELEASE_ROOT="$PWD" \
+            RELEASE_TAG_KEY="${MAIN_TREE}/security/release-tag-key.asc" \
+            RELEASE_TAG_FINGERPRINTS="${MAIN_TREE}/security/release-tag-fingerprints" \
+            bash "${MAIN_TREE}/scripts/verify-release-tag.sh" verify "$TAG" "$sha"
+          git merge-base --is-ancestor "$sha" refs/remotes/origin/main || { echo "tag ${TAG} commit ${sha} is not on main" >&2; exit 1; }
+          test "$(git rev-parse HEAD)" = "$sha"
+      - name: Refuse a published release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # Only "release not found" or a draft may continue; a token that
+          # cannot see drafts reports a draft as not found.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
+      - name: Resolve release commit
+        id: resolve
+        working-directory: source
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "tag=${TAG}" >>"$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+          if [[ "$TAG" == *-* ]]; then
+            echo "prerelease=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >>"$GITHUB_OUTPUT"
+          fi
+
+  scripts:
+    name: Release scripts
+    needs: verify-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify-tag.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
-      - name: Fetch annotated tag object
-        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
-      - name: Verify annotated signed tag equals crate version
-        run: bash scripts/verify-release-tag.sh verify "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
+      - name: Require HEAD at the release commit
+        env:
+          SHA: ${{ needs.verify-tag.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SHA"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - run: bash scripts/validate-release.sh
 
   package:
     name: Package artifacts
     runs-on: ubuntu-latest
     needs: [scripts, verify-tag]
-    if: ${{ !cancelled() && needs.scripts.result == 'success' && (needs.verify-tag.result == 'success' || needs.verify-tag.result == 'skipped') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify-tag.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
+      - name: Require HEAD at the release commit
+        env:
+          SHA: ${{ needs.verify-tag.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SHA"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Package
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          SHA: ${{ needs.verify-tag.outputs.sha }}
         run: |
-          extra=(--git-sha "${GITHUB_SHA}")
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            extra+=(--tag "${GITHUB_REF_NAME}" --with-images)
+          extra=(--git-sha "$SHA")
+          if [[ -n "$TAG" ]]; then
+            extra+=(--tag "$TAG" --with-images)
           else
             extra+=(--skip-test)
           fi
@@ -87,8 +177,8 @@ jobs:
 
   attest:
     name: Attest artifacts
-    needs: package
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-tag, package]
+    if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -98,6 +188,21 @@ jobs:
       attestation-url: ${{ steps.provenance.outputs.attestation-url }}
       sbom-attestation-url: ${{ steps.sbom.outputs.attestation-url }}
     steps:
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again
+          # here. Only "release not found" or a draft may continue.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sekisho-release
@@ -121,18 +226,40 @@ jobs:
             dist/SHA256SUMS
           sbom-path: dist/sekisho.cdx.json
 
+  # Drafts, uploads, then publishes last, after every asset job, so a failed
+  # upload leaves a draft that a re-run for the same tag can resume.
   publish:
     name: GitHub Release
-    needs: [package, attest]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-tag, package, attest]
+    if: needs.verify-tag.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.verify-tag.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
+      - name: Require HEAD at the release commit
+        env:
+          SHA: ${{ needs.verify-tag.outputs.sha }}
+        run: test "$(git rev-parse HEAD)" = "$SHA"
+      - name: Refuse a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # "Re-run failed jobs" reuses verify-tag's outputs, so check again
+          # here. Only "release not found" or a draft may continue.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: sekisho-release
@@ -152,23 +279,58 @@ jobs:
           PY
       - name: Notes from CHANGELOG
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
         run: python3 scripts/changelog-notes.py "${TAG#v}" > dist/RELEASE_NOTES.md
-      - name: Draft then publish GitHub Release
+      - name: Draft GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          # A tag with a "-" (vX.Y.Z-rc.N) is a pre-release and never latest.
+          kind=()
+          if [[ "$PRERELEASE" == true ]]; then
+            kind=(--prerelease --latest=false)
+          fi
+          # A re-run resumes its draft; a published release is never touched.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+            # Every dispatch rebuilds every asset; drop the earlier run's so a
+            # renamed or removed asset is not published.
+            gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
+              gh release delete-asset "$TAG" "$name" --yes
+            done
             gh release upload "$TAG" dist/* --clobber
-            gh release edit "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --draft=false
-          else
+            gh release edit "$TAG" --title "$TAG" --notes-file dist/RELEASE_NOTES.md --draft "${kind[@]}"
+          elif [[ "$state" == *"release not found"* ]]; then
             gh release create "$TAG" dist/* \
               --draft \
               --verify-tag \
+              "${kind[@]}" \
               --title "$TAG" \
               --notes-file dist/RELEASE_NOTES.md
+          else
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+          PRERELEASE: ${{ needs.verify-tag.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+          if [[ "$draft" != true ]]; then
+            echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2
+            exit 1
+          fi
+          if [[ "$PRERELEASE" == true ]]; then
+            gh release edit "$TAG" --draft=false --prerelease --latest=false
+          else
             gh release edit "$TAG" --draft=false
           fi
           echo "Published GitHub Release ${TAG} from CHANGELOG"

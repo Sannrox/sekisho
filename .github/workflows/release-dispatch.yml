@@ -1,0 +1,27 @@
+name: Release dispatch
+
+# A v* tag push only starts release.yml from main for that tag. The release
+# runs main's workflow and tag verifier, so a bug in either is fixed on main
+# and the same tag re-run instead of burning the version; release scripts,
+# CHANGELOG.md, the Containerfile and sources still come from the tagged
+# commit. Keep this file tiny: no checkout, no actions, nothing but the
+# dispatch.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch release from main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch release.yml on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh workflow run release.yml --ref main -f tag="$TAG"
