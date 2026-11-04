@@ -104,20 +104,26 @@ for path in sorted(p for p in out.iterdir() if p.is_file() and p.name != "SHA256
 
 LABEL_ARGS=()
 if [[ -n "$TAG" && "$SKIP_GITHUB" -eq 0 ]] && command -v gh >/dev/null 2>&1; then
-  # Gate flags cover every pull request since the previous final release, so
-  # a final after rc tags (and each rc) still sees work merged before the rc.
-  prev="$(git tag --list 'v*' --sort=-version:refname)"
-  prev="$(awk -v cur="$TAG" '$0 != cur && $0 !~ /-/ { print; exit }' <<<"$prev")"
-  search=()
+  # Gate flags cover exactly the pull requests merged into the release commit
+  # since the nearest final tag before it: an rc tag never starts the range,
+  # or a final release would drop gates first seen in its release candidates,
+  # and a pull request merged after the tagged commit never counts, even when a
+  # retry runs days later.
+  prev="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' "${GIT_SHA}^" 2>/dev/null || true)"
+  range="$GIT_SHA"
+  query="merged:<=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$GIT_SHA")"
   if [[ -n "$prev" ]]; then
-    since="$(git log -1 --format=%cs "$prev" 2>/dev/null || true)"
-    if [[ -n "$since" ]]; then
-      search+=(--search "merged:>=${since}")
-    fi
+    range="${prev}..${GIT_SHA}"
+    query="merged:>=$(TZ=UTC git log -1 --date=format-local:%Y-%m-%d --format=%cd "$prev") ${query}"
   fi
   while IFS= read -r label; do
     [[ -n "$label" ]] && LABEL_ARGS+=(--label "$label")
-  done < <(gh pr list --state merged --limit 100 "${search[@]}" --json labels --jq '.[].labels[].name' 2>/dev/null || true)
+  done < <(
+    gh pr list --state merged --limit 1000 --search "$query" --json mergeCommit,labels \
+      --jq '.[] | select(.mergeCommit != null) | .mergeCommit.oid as $oid | .labels[] | "\($oid)\t\(.name)"' 2>/dev/null \
+      | awk -F'\t' 'NR == FNR { in_range[$1] = 1; next } in_range[$1] { print $2 }' <(git rev-list "$range") - \
+      | sort -u || true
+  )
 fi
 
 python3 "$ROOT_PATH/scripts/release-manifest.py" \
