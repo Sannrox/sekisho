@@ -307,5 +307,5 @@ Rows beyond `## Testing Guidelines`:
 - configuration additions, removals, defaults, and `sekisho.example.toml`;
 - security, rollback, and operator actions;
 - `Containerfile` image packaging (deploy by digest, never a `latest` tag);
-- release notes drafted from the pull request bodies since the last tag with
+- release notes drafted from the pull request bodies since the last final tag with
   `scripts/changelog-draft.sh`; `CHANGELOG.md` changes only in the release.
