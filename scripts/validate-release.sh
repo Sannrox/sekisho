@@ -99,6 +99,26 @@ if grep -E '(:latest|tag: latest|tags: latest)' "$workflow" >/dev/null; then
   fail "${workflow} must not produce a latest image tag"
 fi
 
+# Gate flags come only from pull requests merged into the release commit since
+# the nearest final tag before it, so an rc never starts the range and a retry
+# never counts pull requests merged after the tagged commit.
+grep -F -- "--exclude '*-*' \"\${GIT_SHA}^\"" scripts/release-package.sh >/dev/null \
+  || fail "scripts/release-package.sh must start gate flags at the nearest final tag before the release commit"
+grep -F 'query="merged:<=$(TZ=UTC git log -1' scripts/release-package.sh >/dev/null \
+  || fail "scripts/release-package.sh must bound the gate-flag search at the release commit"
+grep -F 'in_range[$1] { print $2 }' scripts/release-package.sh >/dev/null \
+  || fail "scripts/release-package.sh must keep only gate flags of pull requests in the release range"
+# The lookup hides gh failures, so a missing permission would silently drop
+# every gate flag.
+python3 - "$workflow" <<'PY_PR' || fail "${workflow} package job must request pull-requests: read for gate flags"
+import re, sys
+body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
+jobs = {b.split(":", 1)[0].strip(): b for b in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body)}
+sys.exit(0 if "      pull-requests: read" in jobs.get("package", "") else 1)
+PY_PR
+grep -F -- "--exclude '*-*' origin/main" scripts/changelog-draft.sh >/dev/null \
+  || fail "scripts/changelog-draft.sh must start at the last final tag, not a release candidate"
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/sekisho-release-package.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "${tmp}/dist"
