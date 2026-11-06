@@ -66,11 +66,11 @@ jobs:
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|beta)\.[0-9]+)?$ ]] || { echo "invalid release tag: ${TAG}" >&2; exit 1; }
       - name: Check out main's release-tag verifier
         if: inputs.tag != ''
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: main-tree
       - name: Check out the release tag
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
           path: source
@@ -128,7 +128,7 @@ jobs:
     needs: verify-tag
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-tag.outputs.sha }}
           fetch-depth: 0
@@ -149,7 +149,7 @@ jobs:
       # release-package.sh reads merged pull requests for manifest gate flags.
       pull-requests: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-tag.outputs.sha }}
           fetch-depth: 0
@@ -173,7 +173,7 @@ jobs:
             extra+=(--skip-test)
           fi
           bash scripts/release-package.sh --out dist "${extra[@]}"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sekisho-release
           path: dist/
@@ -207,7 +207,7 @@ jobs:
             echo "cannot read release ${TAG}: ${state}" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sekisho-release
           path: dist
@@ -222,7 +222,7 @@ jobs:
             dist/sekisho.cdx.json
       - name: Attest SBOM
         id: sbom
-        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: |
             dist/sekisho-[0-9]*
@@ -240,7 +240,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-tag.outputs.sha }}
           fetch-depth: 0
@@ -264,7 +264,7 @@ jobs:
             echo "cannot read release ${TAG}: ${state}" >&2
             exit 1
           fi
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sekisho-release
           path: dist
