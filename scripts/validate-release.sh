@@ -70,7 +70,7 @@ fi
 python3 - "$workflow" <<'PY_JOBS' || fail "${workflow} must refuse a published release before every upload, publish, or attestation"
 import re, sys
 body = open(sys.argv[1]).read().split("\njobs:\n", 1)[1]
-mutating = ("gh release upload", "gh release create", "gh release edit", "gh release delete-asset", "actions/attest")
+mutating = ("gh release upload", "gh release create", "gh release edit", "gh release delete-asset", "actions/attest", "--push-image")
 guard = "- name: Refuse a published release"
 bad = []
 for block in re.split(r"(?m)^(?=  [a-z][a-z0-9-]*:\n)", body):
@@ -134,5 +134,27 @@ mkdir -p "$notes_out"
 bash scripts/release-package.sh --out "$notes_out" --skip-build --skip-test --skip-github --tag v0.1.0 --git-sha "$(git rev-parse HEAD)"
 [[ -s "${notes_out}/RELEASE_NOTES.md" ]] || fail "tag dry-run did not write CHANGELOG notes"
 grep -F "First release" "${notes_out}/RELEASE_NOTES.md" >/dev/null || fail "CHANGELOG notes missing expected 0.1.0 body"
+
+# The Tenkai product pins the pushed image by digest in the manifests and the
+# profile, and never renders from a tag.
+fake_image="ghcr.io/sannrox/sekisho@sha256:$(printf '%064d' 0)"
+bash scripts/render-tenkai-product.sh --image "$fake_image" --version 9.8.7 --out "${tmp}/product"
+python3 - "${tmp}/product" "$fake_image" <<'PY_PRODUCT' || fail "rendered Tenkai product is wrong"
+import pathlib, sys, tomllib
+root, image = pathlib.Path(sys.argv[1]), sys.argv[2]
+product = tomllib.loads((root / "tenkai.toml").read_text())
+assert product["product"]["version"] == "9.8.7"
+component = product["compatibility"]["components"]["sekisho"]
+assert component["pin"] == {"kind": "digest", "value": image.split("@")[1]}
+assert component["provides"] == {"sekisho.mcp": "1.0.0"}
+statefulset = (root / "manifests" / "10-statefulset.yaml").read_text()
+assert f'image: "{image}"' in statefulset
+PY_PRODUCT
+if bash scripts/render-tenkai-product.sh --image ghcr.io/sannrox/sekisho:9.8.7 --out "${tmp}/tagged" 2>/dev/null; then
+  fail "render-tenkai-product.sh must refuse an image tag"
+fi
+if bash scripts/release-package.sh --out "${tmp}/push" --skip-build --skip-test --skip-github --push-image ghcr.io/sannrox/sekisho 2>/dev/null; then
+  fail "release-package.sh must refuse --push-image without --with-images and --tag"
+fi
 
 printf 'validate-release passed\n'

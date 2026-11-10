@@ -1,0 +1,23 @@
+# Only pods that declare themselves callers reach sekisho: label a caller's
+# pods `sekisho/caller: "true"` in the same namespace. Kubelet probes are
+# not subject to this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sekisho
+  labels:
+    app.kubernetes.io/name: sekisho
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: sekisho
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              sekisho/caller: "true"
+      ports:
+        - protocol: TCP
+          port: 8090

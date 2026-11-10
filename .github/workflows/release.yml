@@ -14,6 +14,8 @@ on:
       - "scripts/release-manifest.py"
       - "scripts/release-sbom.py"
       - "scripts/release-package.sh"
+      - "scripts/render-tenkai-product.sh"
+      - "deploy/kubernetes/**"
       - "scripts/validate-release.sh"
       - "scripts/changelog-draft.sh"
       - "security/release-tag-key.asc"
@@ -148,7 +150,25 @@ jobs:
       contents: read
       # release-package.sh reads merged pull requests for manifest gate flags.
       pull-requests: read
+      # A tagged run pushes the image the Tenkai product pins by digest.
+      packages: write
     steps:
+      - name: Refuse a published release
+        if: needs.verify-tag.outputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify-tag.outputs.tag }}
+        run: |
+          # The image tag is pushed before the release is drafted. Only
+          # "release not found" or a draft may continue.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1)"; then
+            [[ "$state" == true ]] || { echo "release ${TAG} is already published; cut a new tag instead of re-running" >&2; exit 1; }
+          elif [[ "$state" != *"release not found"* ]]; then
+            echo "cannot read release ${TAG}: ${state}" >&2
+            exit 1
+          fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.verify-tag.outputs.sha }}
@@ -160,15 +180,22 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$SHA"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Log in to the container registry
+        if: needs.verify-tag.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
       - name: Package
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.verify-tag.outputs.tag }}
           SHA: ${{ needs.verify-tag.outputs.sha }}
         run: |
           extra=(--git-sha "$SHA")
           if [[ -n "$TAG" ]]; then
-            extra+=(--tag "$TAG" --with-images)
+            extra+=(--tag "$TAG" --with-images --push-image "ghcr.io/${GH_REPO,,}")
           else
             extra+=(--skip-test)
           fi
