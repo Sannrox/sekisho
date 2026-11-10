@@ -4,6 +4,11 @@
 # Usage:
 #   bash scripts/release-package.sh --out dist [--tag vX.Y.Z] [--git-sha SHA]
 #        [--skip-build] [--skip-test] [--skip-github] [--with-images]
+#        [--push-image ghcr.io/<owner>/sekisho]
+#
+# --push-image (needs --with-images and --tag, and a docker login) pushes the
+# image as <repo>:<version> and renders the Tenkai Kubernetes product pinned
+# to the pushed digest into sekisho-<version>-tenkai-kubernetes.tar.gz.
 set -euo pipefail
 
 ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,6 +21,7 @@ SKIP_BUILD=0
 SKIP_TEST=0
 SKIP_GITHUB=0
 WITH_IMAGES=0
+PUSH_IMAGE=""
 
 fail() {
   printf 'release-package: %s\n' "$1" >&2
@@ -31,11 +37,16 @@ while [[ $# -gt 0 ]]; do
     --skip-test) SKIP_TEST=1; shift ;;
     --skip-github) SKIP_GITHUB=1; shift ;;
     --with-images) WITH_IMAGES=1; shift ;;
+    --push-image) PUSH_IMAGE="${2:-}"; shift 2 ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
 
 [[ -n "$OUT" ]] || fail "usage: $0 --out dist [--tag vX.Y.Z] [--git-sha SHA]"
+if [[ -n "$PUSH_IMAGE" ]]; then
+  [[ "$WITH_IMAGES" -eq 1 && -n "$TAG" ]] || fail "--push-image needs --with-images and --tag"
+  [[ "$PUSH_IMAGE" =~ ^[a-z0-9][a-z0-9./_-]*$ ]] || fail "--push-image takes a lowercase repository without a tag, got ${PUSH_IMAGE}"
+fi
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -88,6 +99,19 @@ if [[ "$WITH_IMAGES" -eq 1 ]]; then
   docker save -o "${OUT}/sekisho-${VERSION}-image.tar" "$local_tag"
   IMAGE_ARGS+=(--image "${local_tag}=${digest}")
   printf 'image %s digest %s\n' "$local_tag" "$digest"
+  if [[ -n "$PUSH_IMAGE" ]]; then
+    remote="${PUSH_IMAGE}:${VERSION}"
+    docker tag "$local_tag" "$remote"
+    docker push "$remote"
+    pushed="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$remote" | grep -m1 "^${PUSH_IMAGE}@sha256:" || true)"
+    [[ -n "$pushed" ]] || fail "no registry digest for ${remote}"
+    IMAGE_ARGS+=(--image "${remote}=${pushed##*@}")
+    printf 'pushed %s as %s\n' "$remote" "$pushed"
+    product="$(mktemp -d "${TMPDIR:-/tmp}/sekisho-product.XXXXXX")"
+    bash "$ROOT_PATH/scripts/render-tenkai-product.sh" --image "$pushed" --version "$VERSION" --out "${product}/sekisho"
+    tar -czf "${OUT}/sekisho-${VERSION}-tenkai-kubernetes.tar.gz" -C "$product" sekisho
+    rm -rf "$product"
+  fi
 fi
 
 python3 "$ROOT_PATH/scripts/release-sbom.py" "${OUT}/sekisho.cdx.json"

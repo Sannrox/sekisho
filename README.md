@@ -467,7 +467,9 @@ includes tokens, key material or file contents.
 
 `Containerfile` builds the release image. Deploy it by digest, not by tag.
 There is no `latest` image tag. Signed `v*` tags and GitHub Releases are
-described in [RELEASING.md](RELEASING.md).
+described in [RELEASING.md](RELEASING.md). Each release also carries a Tenkai
+product for Kubernetes that provides the `sekisho.mcp` contract; see
+[deploy/kubernetes](deploy/kubernetes/README.md).
 
 ## High availability
 

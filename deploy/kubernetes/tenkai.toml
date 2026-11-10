@@ -1,0 +1,39 @@
+# Tenkai product for sekisho on Kubernetes (template).
+#
+# This file and manifests/ are a template: `scripts/render-tenkai-product.sh`
+# fills in the release version and the image digest. The release workflow
+# attaches the rendered product to each GitHub Release as
+# `sekisho-<version>-tenkai-kubernetes.tar.gz`. Install that, not this tree.
+#
+# Before the first apply, create Secret `sekisho-config` in the environment
+# namespace with `sekisho.toml` and the files it names (deploy/kubernetes/README.md).
+
+[product]
+name = "sekisho"
+version = "@VERSION@"
+description = "Governed MCP tool gateway (Kubernetes StatefulSet)"
+kind = "software"
+
+[deploy]
+workdir = "."
+executor = "kubernetes-inprocess"
+inputs = ["manifests"]
+
+[delivery]
+has_migration = false
+changes_identity_config = false
+
+# Contracts this release provides to dependents (Tenkai profile v2). The
+# component pin is the digest of the image the release pushed. Contract
+# versions move by the rules in RELEASING.md, not with the crate version.
+[compatibility]
+version = 2
+# Evidence binds one release digest; one day is Tenkai's maximum.
+max_evidence_age_ms = 86400000
+
+[compatibility.components.sekisho.pin]
+kind = "digest"
+value = "@IMAGE_DIGEST@"
+
+[compatibility.components.sekisho.provides]
+"sekisho.mcp" = "1.0.0"
