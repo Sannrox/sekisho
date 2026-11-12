@@ -43,7 +43,8 @@ enum Command {
     },
     /// Disable a tool or upstream, or deny a destination, under a decision
     /// reference (standalone, or a decided control-plane Action). Changes
-    /// are audited and apply to the next call on every replica.
+    /// are audited and apply to the next call on every replica. A destination
+    /// deny also drops in-flight outbound calls on this replica.
     Mitigation {
         #[command(subcommand)]
         command: MitigationCommand,
@@ -371,6 +372,7 @@ async fn serve(config: &Config) -> Result<()> {
     let federation = Arc::new(Federation::new(
         config.upstreams.clone(),
         Arc::clone(&store),
+        config.egress.clone(),
     ));
     tokio::spawn(federation.clone().run(
         Duration::from_millis(config.registry.refresh_interval_ms),
@@ -395,6 +397,7 @@ async fn serve(config: &Config) -> Result<()> {
     .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
         &store,
     )))
+    .egress(config.egress.clone())
     .limits(sekisho::limits::Limiter::from_config(config, &store));
     let app = router(state, &config.mcp, gateway, shutdown.clone());
     axum::serve(listener, app)

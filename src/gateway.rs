@@ -21,7 +21,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use tokio_util::sync::CancellationToken;
 
 use crate::audit::{CallAudit, CallEvent, Decision, traceparent};
-use crate::config::{McpConfig, UpstreamConfig};
+use crate::config::{EgressConfig, McpConfig, UpstreamConfig};
 use crate::discovery;
 use crate::exchange::Exchanger;
 use crate::limits::{Caller, Limiter, LimitsConfig, cap_response};
@@ -50,6 +50,7 @@ pub const REGISTRY_STALE_AFTER: Duration = Duration::from_secs(5);
 /// Upstreams and the registry snapshot the data plane serves from.
 pub struct Federation {
     pub upstreams: Vec<UpstreamConfig>,
+    egress: EgressConfig,
     store: Arc<dyn StateBackend>,
     /// The last registry read or written, and when that read started.
     registry: RwLock<(Registry, Option<Instant>)>,
@@ -60,9 +61,14 @@ pub struct Federation {
 }
 
 impl Federation {
-    pub fn new(upstreams: Vec<UpstreamConfig>, store: Arc<dyn StateBackend>) -> Self {
+    pub fn new(
+        upstreams: Vec<UpstreamConfig>,
+        store: Arc<dyn StateBackend>,
+        egress: EgressConfig,
+    ) -> Self {
         Self {
             upstreams,
+            egress,
             store,
             registry: RwLock::default(),
             updating: tokio::sync::Mutex::new(()),
@@ -126,6 +132,12 @@ impl Federation {
         // the others or owner edits.
         let mut listings = tokio::task::JoinSet::new();
         for upstream in self.upstreams.clone() {
+            // Egress (#76): do not dial an unlisted origin, and do not
+            // observe an empty listing into the shared registry. A replica
+            // whose allowlist omits this origin still refuses locally.
+            if upstream.egress() && !self.egress.allows_url(&upstream.url) {
+                continue;
+            }
             listings.spawn(async move {
                 let listed =
                     tokio::time::timeout(LISTING_TIMEOUT, crate::upstream::list_tools(&upstream))
@@ -208,6 +220,7 @@ pub struct Gateway {
     guardrails: Arc<crate::guardrails::Guardrails>,
     approvals: Arc<crate::approvals::ApprovalsConfig>,
     mitigations: Option<Arc<crate::mitigations::MitigationStore>>,
+    egress: Arc<EgressConfig>,
 }
 
 /// Why a call did not produce an upstream answer.
@@ -311,7 +324,14 @@ impl Gateway {
             guardrails: Arc::new(crate::guardrails::Guardrails::default()),
             approvals: Arc::new(crate::approvals::ApprovalsConfig::default()),
             mitigations: None,
+            egress: Arc::new(EgressConfig::default()),
         }
+    }
+
+    /// Origins allowed for credential-injected outbound (#76).
+    pub fn egress(mut self, egress: EgressConfig) -> Self {
+        self.egress = Arc::new(egress);
+        self
     }
 
     /// Approval gate for destructive and open-world tools (#21).
@@ -370,9 +390,20 @@ impl Gateway {
             .snapshot()
             .tools
             .into_iter()
-            .filter(|(key, entry)| entry.served() && agent.tools.contains(key))
+            .filter(|(key, entry)| {
+                entry.served() && agent.tools.contains(key) && self.allows_entry(entry)
+            })
             .map(|(key, entry)| (key, entry.approved_version().clone()))
             .collect()
+    }
+
+    /// Whether this replica may advertise or dial `entry`'s upstream.
+    fn allows_entry(&self, entry: &registry::ToolEntry) -> bool {
+        self.federation
+            .upstreams
+            .iter()
+            .find(|upstream| upstream.name == entry.upstream)
+            .is_some_and(|upstream| !upstream.egress() || self.egress.allows_url(&upstream.url))
     }
 
     /// The caller's agent policy, loaded fresh from the store within
@@ -545,6 +576,11 @@ impl Gateway {
             .iter()
             .find(|upstream| upstream.name == entry.upstream)
             .ok_or_else(|| Refused::denied(&tool, "tool upstream is not configured"))?;
+        // Egress (#76): a no-audience upstream is dialed only when its origin
+        // is on `[egress] allow`. Engine exchange upstreams skip this list.
+        if upstream.egress() && !self.egress.allows_url(&upstream.url) {
+            return Err(Refused::denied(&tool, "destination is not allowed"));
+        }
         // Mitigations (#42): the shared store is read on every forwarded call,
         // so a change from any replica applies to the next one. A store that
         // cannot be read refuses the call.
@@ -640,32 +676,52 @@ impl Gateway {
         // Every outcome after the gate carries its label: an engine-routed call
         // that fails or is blocked may already have run upstream.
         let forwarded = async {
-            let caller_token = context
-                .extensions
-                .get::<axum::http::request::Parts>()
-                .and_then(|parts| parts.extensions.get::<CallerToken>())
-                .cloned()
-                .ok_or_else(|| Refused::denied(&tool, "request has no caller token"))?;
-            let delegated = self
-                .exchanger
-                .token(crate::exchange::Request {
-                    caller_token: &caller_token.0,
-                    agent: &agent.id,
-                    ceiling: &agent.ceiling,
-                    audience: &upstream.audience,
-                    tool: &entry.name,
-                })
-                .await
-                .map_err(|error| {
-                    eprintln!("{error}");
-                    match error {
-                        crate::exchange::ExchangeError::Failed(_) => Refused::failed(
-                            "token exchange failed",
-                            McpError::internal_error("token exchange failed", None),
-                        ),
-                        _ => Refused::denied(&tool, "token exchange refused"),
+            let injected = if upstream.egress() {
+                Some(read_egress_credential(upstream).map_err(|reason| {
+                    if reason == "egress credential is unreadable" {
+                        Refused::failed(
+                            reason,
+                            McpError::internal_error(reason.to_string(), None),
+                        )
+                    } else {
+                        Refused::denied(&tool, reason)
                     }
-                })?;
+                })?)
+            } else {
+                None
+            };
+            let bearer = if let Some(secret) = injected.as_ref() {
+                secret.clone()
+            } else {
+                let caller_token = context
+                    .extensions
+                    .get::<axum::http::request::Parts>()
+                    .and_then(|parts| parts.extensions.get::<CallerToken>())
+                    .cloned()
+                    .ok_or_else(|| Refused::denied(&tool, "request has no caller token"))?;
+                let audience = upstream.audience.as_deref().filter(|a| !a.is_empty()).ok_or_else(
+                    || Refused::denied(&tool, "tool upstream is not configured"),
+                )?;
+                self.exchanger
+                    .token(crate::exchange::Request {
+                        caller_token: &caller_token.0,
+                        agent: &agent.id,
+                        ceiling: &agent.ceiling,
+                        audience,
+                        tool: &entry.name,
+                    })
+                    .await
+                    .map_err(|error| {
+                        eprintln!("{error}");
+                        match error {
+                            crate::exchange::ExchangeError::Failed(_) => Refused::failed(
+                                "token exchange failed",
+                                McpError::internal_error("token exchange failed", None),
+                            ),
+                            _ => Refused::denied(&tool, "token exchange refused"),
+                        }
+                    })?
+            };
             let mut started = call.event.clone();
             started.approval = approval.map(str::to_string);
             let audit = Arc::clone(&self.audit);
@@ -682,26 +738,37 @@ impl Gateway {
             }
             call.forwarded = true;
             let traceparent = traceparent(&call.event.trace_id);
+            let secret = injected.clone();
             let call = crate::upstream::call_tool(
                 upstream,
                 &entry.name,
                 request.arguments,
-                delegated,
+                bearer,
                 &traceparent,
             );
             // A cancelled or disconnected caller drops the upstream call, which
-            // closes its connection.
+            // closes its connection. A destination deny applied while the call
+            // is in flight does the same (#76).
             let limit = Duration::from_millis(self.limiter.config().max_call_ms);
             let call = async move {
                 tokio::time::timeout(limit, call)
                     .await
                     .unwrap_or_else(|_| Err(crate::upstream::timed_out_call(upstream)))
             };
+            let kill = watch_mitigation(
+                self.mitigations.clone(),
+                tool.clone(),
+                entry.upstream.clone(),
+                upstream.url.clone(),
+                agent.id.clone(),
+                principal.tenant.clone(),
+            );
             let result = tokio::select! {
                 result = call => result.map_err(|error| {
                     // Upstream error text is upstream-controlled; it reaches the
-                    // agent only when inbound screening passes it (#10).
-                    let message = error.to_string();
+                    // agent only when inbound screening passes it (#10). The
+                    // injected egress credential never does (#76).
+                    let message = hide_secret(error.to_string(), secret.as_deref());
                     let screened = self
                         .guardrails
                         .screen_inbound(&message, None, guardrail_policy);
@@ -725,10 +792,19 @@ impl Gateway {
                 () = context.ct.cancelled() => {
                     return Err(Refused::failed("request cancelled", McpError::internal_error("request cancelled", None)));
                 }
+                mitigation = kill => {
+                    return Err(Refused::mitigated(&tool, &mitigation));
+                }
             };
             // Screen and transform the original result; only then cap it, so
             // truncation can never cut through a span first (#10).
             let original_json = serde_json::to_value(&result).ok();
+            if result_leaks_secret(original_json.as_ref(), secret.as_deref()) {
+                return Err(Refused::failed(
+                    "upstream call failed",
+                    McpError::internal_error("upstream call failed", None),
+                ));
+            }
             let mut result = result;
             // Every textual surface is screened: text blocks, non-text blocks
             // in serialized form, and structured content (#10).
@@ -1048,6 +1124,95 @@ struct CallState {
     budget: Duration,
 }
 
+fn read_egress_credential(upstream: &UpstreamConfig) -> Result<String, &'static str> {
+    let path = upstream
+        .token_file
+        .as_deref()
+        .ok_or("egress credential is missing")?;
+    let secret = std::fs::read_to_string(path)
+        .map_err(|error| {
+            eprintln!("{error}");
+            "egress credential is unreadable"
+        })?
+        .trim()
+        .to_string();
+    if secret.is_empty() {
+        Err("egress credential is missing")
+    } else {
+        Ok(secret)
+    }
+}
+
+fn result_leaks_secret(original: Option<&serde_json::Value>, secret: Option<&str>) -> bool {
+    let Some(secret) = secret.filter(|secret| !secret.is_empty()) else {
+        return false;
+    };
+    let Some(value) = original else {
+        return false;
+    };
+    if value.to_string().contains(secret) {
+        return true;
+    }
+    let mut decoded = Vec::new();
+    crate::guardrails::Guardrails::decoded_strings(value, &mut decoded);
+    decoded.iter().any(|text| text.contains(secret))
+}
+
+fn hide_secret(text: String, secret: Option<&str>) -> String {
+    match secret {
+        Some(secret) if !secret.is_empty() && text.contains(secret) => {
+            let stripped = text.replace(secret, "");
+            if stripped.trim().is_empty() {
+                "upstream call failed".into()
+            } else {
+                stripped
+            }
+        }
+        _ => text,
+    }
+}
+
+/// Completes when an active mitigation would refuse this call, so an
+/// in-flight outbound dial can be dropped. Without a store, never completes.
+async fn watch_mitigation(
+    store: Option<Arc<crate::mitigations::MitigationStore>>,
+    tool: String,
+    upstream: String,
+    url: String,
+    agent: String,
+    tenant: Option<String>,
+) -> crate::mitigations::Mitigation {
+    let Some(store) = store else {
+        std::future::pending::<()>().await;
+        unreachable!()
+    };
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let store = Arc::clone(&store);
+        let (tool, upstream, url, agent, tenant) = (
+            tool.clone(),
+            upstream.clone(),
+            url.clone(),
+            agent.clone(),
+            tenant.clone(),
+        );
+        let checked = tokio::task::spawn_blocking(move || {
+            let call = crate::mitigations::Call {
+                tool: &tool,
+                upstream: &upstream,
+                url: &url,
+                agent: &agent,
+                tenant: tenant.as_deref(),
+            };
+            store.check(&call, crate::mitigations::now_ms())
+        })
+        .await;
+        if let Ok(Ok(Some(mitigation))) = checked {
+            return mitigation;
+        }
+    }
+}
+
 fn unix_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1107,7 +1272,7 @@ mod tests {
         );
         let file = dir.path().join("registry.json");
         std::fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
-        let federation = Federation::new(Vec::new(), store);
+        let federation = Federation::new(Vec::new(), store, EgressConfig::default());
         assert!(federation.stale(), "nothing loaded yet");
         federation.reload().await.unwrap();
         assert!(!federation.stale());
@@ -1132,6 +1297,7 @@ mod tests {
         let federation = Federation::new(
             Vec::new(),
             Arc::new(crate::state::Directory::in_dir(dir.path())),
+            EgressConfig::default(),
         );
         let older = Instant::now();
         let mut newer = Registry::default();

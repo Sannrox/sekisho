@@ -41,6 +41,7 @@ async fn start() -> Running {
     let federation = Arc::new(sekisho::gateway::Federation::new(
         Vec::new(),
         Arc::clone(&store),
+        Default::default(),
     ));
     let gateway = sekisho::gateway::Gateway::new(
         federation,
@@ -214,6 +215,7 @@ async fn configured_browser_origins_pass_cors_preflight() {
     let federation = Arc::new(sekisho::gateway::Federation::new(
         Vec::new(),
         Arc::clone(&store),
+        Default::default(),
     ));
     let gateway = sekisho::gateway::Gateway::new(
         federation,

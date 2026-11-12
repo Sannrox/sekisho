@@ -1,8 +1,10 @@
 //! MCP client calls to an upstream server: list its tools, call one.
 //!
 //! Each call opens a short stateless connection. The listing token is only
-//! used to list tools. A tool call carries the delegated token exchanged for
-//! that caller and tool ([`crate::exchange`]), never Sekisho's credential.
+//! used to list tools on an engine upstream. A tool call carries the delegated
+//! token exchanged for that caller and tool ([`crate::exchange`]), or the
+//! destination credential on an egress upstream, never a credential the
+//! agent could read.
 
 use std::path::Path;
 

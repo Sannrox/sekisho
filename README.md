@@ -124,7 +124,7 @@ flowchart LR
   V --> P[agent policy]
   P --> L[rate limits]
   L --> G[registry, mitigations, guardrails, approval gate]
-  G --> X[token exchange]
+  G --> X[token exchange or injected credential]
   X --> U[upstream tool server]
   G -. every decision .-> AU[(call audit)]
   X -. started / outcome .-> AU
@@ -174,7 +174,9 @@ Upstream listings are re-read every `refresh_interval_ms` and the stored
 registry every second, so changes apply without a restart. A replica that
 cannot load the registry for 5 s serves no tools until it can. Owner edits
 are appended to the audit file. The optional `token_file` is used only to
-list tools; tool calls never carry it.
+list tools on an engine upstream (`audience` set); tool calls never carry it.
+An upstream without `audience` is egress: the same file is injected on the
+call, and the origin must be listed in `[egress] allow`.
 
 ```sh
 sekisho --config sekisho.toml registry list
@@ -195,6 +197,19 @@ engine sees only that token. Tokens are cached per caller token, agent,
 ceiling, audience and tool until shortly before the issuer's `expires_in`;
 tokens without it are not cached. If the exchange fails, or `[exchange]` is
 not configured, the call is refused and audited; nothing broader is tried.
+Egress upstreams skip exchange and inject `token_file` instead.
+
+### Outbound egress
+
+Agents reach external MCP servers only through configured `[[upstreams]]`
+whose origin is on `[egress] allow` (`scheme://host[:port]`, the same origin
+form as a destination mitigation). Those upstreams omit `audience` and inject
+`token_file` on list and call; the agent never sees that credential, and
+neither does the call audit. An origin not on the list is refused before
+dial and audited as denied. Engine upstreams (`audience` set) keep per-call
+token exchange and do not consult the list. Applying a destination deny
+drops in-flight outbound calls to that origin on this replica, then refuses
+later calls as in [Mitigations](#mitigations).
 
 ### Progressive discovery
 
@@ -394,7 +409,8 @@ needs a filesystem whose exclusive locks all replicas see; changes are
 serialized under a lock and replace the file atomically, and every forwarded
 call reads it, so a change applies to the next call on every replica without
 a restart. A mitigated call is refused before the token exchange and audited
-as `denied` with the decision in `mitigation`. A store that cannot be read
+as `denied` with the decision in `mitigation`. A destination deny also drops
+in-flight outbound calls to that origin on this replica. A store that cannot be read
 or parsed refuses every forwarded call. Expiry is checked from the stored
 time on each call; the first call after it removes the mitigation and audits
 `expire` once. Apply, lift, expire and refuse are appended to `[mitigations]
