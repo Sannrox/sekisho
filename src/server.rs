@@ -1,9 +1,10 @@
-//! HTTP host: `/healthz` (liveness), `/readyz` (the state backend can do
-//! work), `/metrics`, OAuth protected-resource metadata, the MCP endpoint at
-//! `/mcp` behind bearer authentication, and `/audit/calls` for configured
-//! audit readers.
+//! HTTP host: `/healthz` (liveness), `/readyz` (stores can do work, and a
+//! configured token issuer or control plane can be reached), `/metrics`,
+//! OAuth protected-resource metadata, the MCP endpoint at `/mcp` behind
+//! bearer authentication, and `/audit/calls` for configured audit readers.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{Request, State};
@@ -108,7 +109,13 @@ pub fn router(
         }));
     let readiness = Router::new()
         .route("/readyz", get(readyz))
-        .with_state((gateway.state(), gateway.federation()));
+        .with_state(Readiness {
+            store: gateway.state(),
+            federation: gateway.federation(),
+            exchanger: gateway.exchanger(),
+            control_plane: gateway.control_plane_endpoint(),
+            deps: Arc::new(Mutex::new(None)),
+        });
     let mcp_service = Router::new()
         .nest_service("/mcp", crate::gateway::service(mcp, gateway, shutdown))
         .layer(middleware::from_fn_with_state(auth, require_bearer));
@@ -294,26 +301,80 @@ async fn audit_calls(
     }
 }
 
-/// `GET /readyz`: 200 when every store of the state backend can do work,
+#[derive(Clone)]
+struct Readiness {
+    store: Arc<dyn crate::state::StateBackend>,
+    federation: Arc<crate::gateway::Federation>,
+    exchanger: Arc<crate::exchange::Exchanger>,
+    control_plane: Option<String>,
+    deps: Arc<Mutex<Option<(Instant, Deps)>>>,
+}
+
+#[derive(Clone, Copy)]
+struct Deps {
+    exchange: Option<&'static str>,
+    control_plane: Option<&'static str>,
+}
+
+fn probe_status(result: Result<(), String>) -> &'static str {
+    if result.is_ok() { "ok" } else { "unavailable" }
+}
+
+async fn dependency_status(ready: &Readiness) -> Deps {
+    {
+        let cached = ready
+            .deps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, deps)) = cached.as_ref()
+            && at.elapsed() < crate::state::PROBE_TTL
+        {
+            return *deps;
+        }
+    }
+    let (exchange, control_plane) = tokio::join!(ready.exchanger.probe(), async {
+        match &ready.control_plane {
+            Some(endpoint) => Some(crate::control_plane::probe_origin(endpoint).await),
+            None => None,
+        }
+    });
+    if let Some(Err(reason)) = &exchange {
+        eprintln!("readiness: exchange unavailable: {reason}");
+    }
+    if let Some(Err(reason)) = &control_plane {
+        eprintln!("readiness: control plane unavailable: {reason}");
+    }
+    let deps = Deps {
+        exchange: exchange.map(probe_status),
+        control_plane: control_plane.map(probe_status),
+    };
+    *ready
+        .deps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Instant::now(), deps));
+    deps
+}
+
+/// `GET /readyz`: 200 when every store of the state backend can do work
+/// and each configured token issuer or control-plane origin answers HTTP,
 /// else 503. The body names the backend and each store as `ok` or
-/// `unavailable`; reasons go to the log only, since they carry paths. The
-/// registry also counts as unavailable while this replica's registry
-/// snapshot is stale ([`crate::gateway::REGISTRY_STALE_AFTER`]).
-async fn readyz(
-    State((store, federation)): State<(
-        Arc<dyn crate::state::StateBackend>,
-        Arc<crate::gateway::Federation>,
-    )>,
-) -> Response {
-    let kind = store.kind();
-    // A probe stuck past the deadline is not ready either.
-    let Ok(probe) = crate::state::blocking(
+/// `unavailable`; configured `exchange` and `control_plane` use the same
+/// words. Reasons go to the log only, since they carry paths. The registry
+/// also counts as unavailable while this replica's registry snapshot is
+/// stale ([`crate::gateway::REGISTRY_STALE_AFTER`]).
+async fn readyz(State(ready): State<Readiness>) -> Response {
+    let kind = ready.store.kind();
+    let store = Arc::clone(&ready.store);
+    // Store deadline and origin timeout run together so the probe stays
+    // inside the Kubernetes readiness timeout.
+    let mut store_deadline = crate::state::STORE_DEADLINE;
+    let store_probe = crate::state::blocking(
         crate::state::Store::Limits,
-        &mut crate::state::STORE_DEADLINE.clone(),
+        &mut store_deadline,
         move || Ok(store.probe()),
-    )
-    .await
-    else {
+    );
+    let (probe, deps) = tokio::join!(store_probe, dependency_status(&ready));
+    let Ok(probe) = probe else {
         eprintln!("readiness: the probe did not answer within the store deadline");
         return (StatusCode::SERVICE_UNAVAILABLE, "readiness probe failed\n").into_response();
     };
@@ -329,17 +390,25 @@ async fn readyz(
         };
         stores.insert(name, status);
     }
-    if federation.stale() {
+    if ready.federation.stale() {
         eprintln!("readiness: the registry snapshot is stale");
         stores.insert(crate::state::Store::Registry, "unavailable");
     }
-    let ready = stores.values().all(|state| *state == "ok");
+    let ready = stores.values().all(|state| *state == "ok")
+        && deps.exchange.is_none_or(|state| state == "ok")
+        && deps.control_plane.is_none_or(|state| state == "ok");
     let status = if ready {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    let body = serde_json::json!({ "backend": kind, "ready": ready, "stores": stores });
+    let mut body = serde_json::json!({ "backend": kind, "ready": ready, "stores": stores });
+    if let Some(exchange) = deps.exchange {
+        body["exchange"] = serde_json::Value::String(exchange.into());
+    }
+    if let Some(control_plane) = deps.control_plane {
+        body["control_plane"] = serde_json::Value::String(control_plane.into());
+    }
     (status, axum::Json(body)).into_response()
 }
 

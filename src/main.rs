@@ -397,6 +397,13 @@ async fn serve(config: &Config) -> Result<()> {
     .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
         &store,
     )))
+    .control_plane(
+        config
+            .mitigations
+            .control_plane
+            .as_ref()
+            .map(|plane| plane.endpoint.clone()),
+    )
     .egress(config.egress.clone())
     .limits(sekisho::limits::Limiter::from_config(config, &store));
     let app = router(state, &config.mcp, gateway, shutdown.clone());

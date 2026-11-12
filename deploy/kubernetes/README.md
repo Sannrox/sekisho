@@ -9,7 +9,8 @@ installable.
 ## What it installs
 
 - **StatefulSet `sekisho`**, one replica, image pinned by digest. Readiness is
-  `/readyz`, which is ready only while every state store can do work.
+  `/readyz`, which is ready only while every state store can do work, and
+  while a configured token issuer or control plane can be reached.
   Liveness is `/healthz`.
 - **Volume `data`** at `/var/lib/sekisho` (1 Gi, `ReadWriteOnce`). The claim
   outlives the pod, restarts, upgrades and an uninstall.

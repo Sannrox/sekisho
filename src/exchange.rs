@@ -83,6 +83,14 @@ impl Exchanger {
         }
     }
 
+    /// `None` when exchange is not configured. `Err` when the token
+    /// endpoint cannot be reached. An HTTP answer, including a client or
+    /// server error, is reachable. Does not send the client secret or
+    /// follow redirects.
+    pub async fn probe(&self) -> Option<Result<(), String>> {
+        Some(probe_origin(&self.config.as_ref()?.token_endpoint).await)
+    }
+
     pub async fn token(&self, request: Request<'_>) -> Result<String, ExchangeError> {
         let config = self.config.as_ref().ok_or(ExchangeError::NotConfigured)?;
         // Upstream-supplied names must not smuggle extra scope values.
@@ -158,6 +166,20 @@ impl Exchanger {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+async fn probe_origin(endpoint: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|error| error.to_string())?;
+    client
+        .get(endpoint)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.without_url().to_string())
 }
 
 /// One scope value: non-empty, ASCII letters, digits, `.`, `_` or `-`.

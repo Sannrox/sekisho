@@ -49,12 +49,15 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 10
-          # Ready only when every state store can do work.
+          # Ready when every store can do work, and a configured issuer
+          # or control plane can be reached. timeoutSeconds covers the
+          # 5 s store deadline and 2 s origin probe running together.
           readinessProbe:
             httpGet:
               path: /readyz
               port: http
             periodSeconds: 5
+            timeoutSeconds: 10
           resources:
             requests:
               cpu: 50m
