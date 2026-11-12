@@ -270,7 +270,12 @@ backend = "postgres"` keeps every store in PostgreSQL, for replicas on
 separate hosts; see [PostgreSQL](#postgresql) below. `GET /readyz` answers
 200 when every store can do work and 503 otherwise, with `{"backend",
 "ready", "stores"}` naming each store `ok` or `unavailable`; the reason goes
-to the log. A store is ready when its data parses and its write path works: a
+to the log. When `[exchange]` is set, the body also names `exchange`; when
+`[mitigations.control_plane]` is set, `control_plane`. Those are `ok` when
+the origin answers HTTP (any status) and `unavailable` when it cannot be
+reached; the probe does not send secrets or mint a token. Omit either and
+readiness stays store-only. A store is ready when its data parses and its
+write path works: a
 scratch file is created, synced, renamed and removed in its directory while
 the store's writer lock is held, and its audit log opens with the writer's
 options; an audit log's directory also takes the scratch write, so a full

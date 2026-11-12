@@ -55,6 +55,9 @@ fn starts_offline_with_a_local_jwks_and_serves_health_and_metrics() {
     let metrics = get(&address, "/metrics");
     assert!(metrics.contains("sekisho_build_info{"), "{metrics}");
     assert!(metrics.contains("verifier=\"jwks\""), "{metrics}");
+    let ready = get(&address, "/readyz");
+    assert!(!ready.contains("\"exchange\""), "{ready}");
+    assert!(!ready.contains("\"control_plane\""), "{ready}");
 }
 
 #[test]

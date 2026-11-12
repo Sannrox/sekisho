@@ -27,6 +27,24 @@ pub const KIND_MITIGATION: &str = "security_mitigation";
 const GET_ACTION: &str = "/sekai.SekaiService/GetActionInstance";
 const GET_OBJECT: &str = "/sekai.SekaiService/GetObject";
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+/// Longest a readiness probe waits for the origin.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether `endpoint` answers HTTP. Does not send the control-plane token
+/// or follow redirects: a 3xx from this origin is reachable.
+pub async fn probe_origin(endpoint: &str) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .map_err(|error| error.to_string())?;
+    client
+        .get(endpoint)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| error.without_url().to_string())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ControlPlaneError {

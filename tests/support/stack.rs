@@ -135,8 +135,8 @@ impl ServerHandler for Upstream {
     }
 }
 
-async fn serve_on_loopback(app: axum::Router, stop: CancellationToken) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn serve_on(app: axum::Router, stop: CancellationToken, bind: &str) -> String {
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
         let _ = axum::serve(listener, app)
@@ -144,6 +144,43 @@ async fn serve_on_loopback(app: axum::Router, stop: CancellationToken) -> String
             .await;
     });
     address
+}
+
+async fn serve_on_loopback(app: axum::Router, stop: CancellationToken) -> String {
+    serve_on(app, stop, "127.0.0.1:0").await
+}
+
+/// Loopback origin that answers GET / until `stop` is cancelled.
+pub async fn serve_origin(stop: CancellationToken) -> String {
+    serve_on_loopback(
+        axum::Router::new().route("/", axum::routing::get(|| async { "ok\n" })),
+        stop,
+    )
+    .await
+}
+
+async fn bind_retry(bind: &str) -> tokio::net::TcpListener {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::net::TcpListener::bind(bind).await {
+            Ok(listener) => return listener,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => panic!("bind {bind}: {error}"),
+        }
+    }
+}
+
+/// Bind `serve_origin` on `bind` (`host:port`), retrying until the port is free.
+pub async fn serve_origin_at(bind: &str, stop: CancellationToken) {
+    let listener = bind_retry(bind).await;
+    let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok\n" }));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { stop.cancelled_owned().await })
+            .await;
+    });
 }
 
 /// Poll `condition` until it holds or `limit` passes.
@@ -197,6 +234,9 @@ pub struct Stack {
     pub traceparents: Arc<Mutex<Vec<Option<String>>>>,
     /// Makes the fake issuer refuse every exchange.
     pub issuer_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Loopback address of the fake issuer (`host:port`).
+    pub issuer_address: String,
+    issuer_stop: std::sync::Mutex<CancellationToken>,
     /// An upstream `hold` call has started sleeping.
     pub hold_entered: Arc<std::sync::atomic::AtomicBool>,
     /// An upstream `pause` call is waiting for [`Self::resume`].
@@ -293,7 +333,9 @@ impl Stack {
         .await;
 
         let issuer_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let issuer_address = serve_on_loopback(issuer(issuer_down.clone()), stop.clone()).await;
+        let issuer_stop = stop.child_token();
+        let issuer_address =
+            serve_on_loopback(issuer(issuer_down.clone()), issuer_stop.clone()).await;
         let fixture = Fixture::new();
         fixture.write("client-secret", "issuer-secret\n");
         if let Some(agents) = agents_toml {
@@ -365,6 +407,13 @@ impl Stack {
         .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
             &store,
         )))
+        .control_plane(
+            config
+                .mitigations
+                .control_plane
+                .as_ref()
+                .map(|plane| plane.endpoint.clone()),
+        )
         .egress(config.egress.clone())
         .limits(sekisho::limits::Limiter::from_config(&config, &store));
         let app = router(state, &config.mcp, gateway, stop.clone());
@@ -377,6 +426,8 @@ impl Stack {
             seen,
             traceparents,
             issuer_down,
+            issuer_address,
+            issuer_stop: std::sync::Mutex::new(issuer_stop),
             hold_entered,
             paused,
             resume,
@@ -384,6 +435,30 @@ impl Stack {
             stop,
             _fixture: fixture,
         }
+    }
+
+    /// Stop the fake issuer so its token endpoint cannot be reached.
+    pub async fn stop_issuer(&self) {
+        self.issuer_stop.lock().unwrap().cancel();
+        let address = self.issuer_address.clone();
+        let gone = eventually(Duration::from_secs(2), async || {
+            tokio::net::TcpStream::connect(&address).await.is_err()
+        })
+        .await;
+        assert!(gone, "issuer still listening on {address}");
+    }
+
+    /// Bind the fake issuer again on the address in the loaded config.
+    pub async fn resume_issuer(&self) {
+        let stop = self.stop.child_token();
+        *self.issuer_stop.lock().unwrap() = stop.clone();
+        let listener = bind_retry(&self.issuer_address).await;
+        let app = issuer(self.issuer_down.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { stop.cancelled_owned().await })
+                .await;
+        });
     }
 
     /// Another replica sharing this stack's files.
@@ -425,6 +500,13 @@ impl Stack {
         .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
             &store,
         )))
+        .control_plane(
+            config
+                .mitigations
+                .control_plane
+                .as_ref()
+                .map(|plane| plane.endpoint.clone()),
+        )
         .egress(config.egress.clone())
         .limits(sekisho::limits::Limiter::from_config(config, &store));
         let app = router(state, &config.mcp, gateway, stop.clone());

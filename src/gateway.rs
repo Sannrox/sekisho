@@ -221,6 +221,9 @@ pub struct Gateway {
     approvals: Arc<crate::approvals::ApprovalsConfig>,
     mitigations: Option<Arc<crate::mitigations::MitigationStore>>,
     egress: Arc<EgressConfig>,
+    /// Control-plane origin when configured; readiness probes it, the
+    /// serving path does not send the token.
+    control_plane: Option<String>,
 }
 
 /// Why a call did not produce an upstream answer.
@@ -325,7 +328,14 @@ impl Gateway {
             approvals: Arc::new(crate::approvals::ApprovalsConfig::default()),
             mitigations: None,
             egress: Arc::new(EgressConfig::default()),
+            control_plane: None,
         }
+    }
+
+    /// Origin of `[mitigations.control_plane]`, for readiness.
+    pub fn control_plane(mut self, endpoint: Option<String>) -> Self {
+        self.control_plane = endpoint;
+        self
     }
 
     /// Origins allowed for credential-injected outbound (#76).
@@ -355,6 +365,16 @@ impl Gateway {
     /// The registry snapshot this replica serves, for readiness.
     pub fn federation(&self) -> Arc<Federation> {
         Arc::clone(&self.federation)
+    }
+
+    /// Token exchange, for readiness of a configured issuer.
+    pub fn exchanger(&self) -> Arc<Exchanger> {
+        Arc::clone(&self.exchanger)
+    }
+
+    /// Control-plane origin when configured, for readiness.
+    pub fn control_plane_endpoint(&self) -> Option<String> {
+        self.control_plane.clone()
     }
 
     /// The call audit, shared with the `/audit/calls` read route.

@@ -1,12 +1,15 @@
 //! Shared rate-limit file, durable audit, kill-replica retries, and readiness
-//! that follows the state backend.
+//! that follows the state backend, a configured issuer, and a control plane.
 
 mod support;
 
 use std::time::Duration;
 
 use sekisho::audit::{CallEvent, Decision};
-use support::stack::{Stack, echo_call, eventually, readiness_settles, readyz};
+use support::stack::{
+    Stack, echo_call, eventually, readiness_settles, readyz, serve_origin, serve_origin_at,
+};
+use tokio_util::sync::CancellationToken;
 
 const AGENTS: &str = "[[agents]]\nid = \"agent-7\"\ntools = [\"tools.echo\"]\n";
 const CLUSTER: &str = "\n[cluster]\nstate_dir = \"cluster\"\n[limits]\nagent = { rate_per_sec = 0.001, burst = 2.0 }\n";
@@ -200,4 +203,52 @@ async fn an_unusable_lock_or_audit_log_fails_readiness_for_its_store() {
         assert_eq!(body["stores"][store], "unavailable", "{body}");
         readiness_settles(&stack.address, 200).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_down_token_issuer_fails_readiness_until_it_answers() {
+    let stack = Stack::start_with(Some(AGENTS), "\n[cluster]\nstate_dir = \"cluster\"\n").await;
+    let body = readiness_settles(&stack.address, 200).await;
+    assert_eq!(body["exchange"], "ok", "{body}");
+    assert!(body.get("control_plane").is_none(), "{body}");
+
+    stack.stop_issuer().await;
+    let body = readiness_settles(&stack.address, 503).await;
+    assert_eq!(body["exchange"], "unavailable", "{body}");
+    assert!(!body.to_string().contains(&stack.issuer_address), "{body}");
+
+    stack.resume_issuer().await;
+    let body = readiness_settles(&stack.address, 200).await;
+    assert_eq!(body["exchange"], "ok", "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_down_control_plane_fails_readiness_until_it_answers() {
+    let plane_stop = CancellationToken::new();
+    let plane = serve_origin(plane_stop.clone()).await;
+    let extra = format!(
+        "\n[cluster]\nstate_dir = \"cluster\"\n[mitigations.control_plane]\n\
+         endpoint = \"http://{plane}\"\ntoken_file = \"plane-token\"\nnamespace = \"acme\"\n"
+    );
+    let stack = Stack::start_with(Some(AGENTS), &extra).await;
+    let body = readiness_settles(&stack.address, 200).await;
+    assert_eq!(body["control_plane"], "ok", "{body}");
+    assert_eq!(body["exchange"], "ok", "{body}");
+
+    plane_stop.cancel();
+    let gone = eventually(Duration::from_secs(2), async || {
+        tokio::net::TcpStream::connect(&plane).await.is_err()
+    })
+    .await;
+    assert!(gone, "control plane still listening on {plane}");
+    let body = readiness_settles(&stack.address, 503).await;
+    assert_eq!(body["control_plane"], "unavailable", "{body}");
+    assert_eq!(body["exchange"], "ok", "{body}");
+    assert!(!body.to_string().contains(&plane), "{body}");
+
+    let resume = CancellationToken::new();
+    serve_origin_at(&plane, resume.clone()).await;
+    let body = readiness_settles(&stack.address, 200).await;
+    assert_eq!(body["control_plane"], "ok", "{body}");
+    resume.cancel();
 }
