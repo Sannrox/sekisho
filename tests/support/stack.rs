@@ -25,8 +25,12 @@ use super::*;
 pub const ENGINE_AUDIENCE: &str = "tools-engine";
 const ISSUER_KID: &str = "issuer-2";
 
+/// Bearer injected on egress calls in [`Stack::start_egress`].
+pub const EGRESS_SECRET: &str = "egress-credential-does-not-leak-9911";
+
 /// Upstream with `echo` and `other` tools. Every call must carry a token the
 /// fake issuer minted for this audience and that tool; it records the claims.
+/// When `static_bearer` is set, that exact token is accepted instead.
 #[derive(Clone)]
 struct Upstream {
     description: Arc<Mutex<String>>,
@@ -37,6 +41,8 @@ struct Upstream {
     /// A `pause` call sets `paused` and answers once `resume` is notified.
     paused: Arc<std::sync::atomic::AtomicBool>,
     resume: Arc<tokio::sync::Notify>,
+    static_bearer: Option<String>,
+    list_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Claims of a delegated token, if signed by the issuer for this audience.
@@ -63,6 +69,8 @@ impl ServerHandler for Upstream {
         _: Option<PaginatedRequestParams>,
         _: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        self.list_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let description = self.description.lock().unwrap().clone();
         let serde_json::Value::Object(schema) = serde_json::json!({"type": "object"}) else {
             unreachable!()
@@ -86,14 +94,20 @@ impl ServerHandler for Upstream {
             .and_then(|value| value.strip_prefix("Bearer "))
             .map(str::to_string)
             .unwrap_or_default();
-        let claims = delegated_claims(&token)
-            .filter(|claims| {
-                let wanted = format!("tool:{}", request.name);
-                claims["scope"]
-                    .as_str()
-                    .is_some_and(|scope| scope.split(' ').any(|s| s == wanted))
-            })
-            .ok_or_else(|| ErrorData::invalid_params("token is not for this tool", None))?;
+        let claims = if let Some(expected) = &self.static_bearer {
+            (token == *expected)
+                .then(|| serde_json::json!({ "injected": true }))
+                .ok_or_else(|| ErrorData::invalid_params("token is not for this tool", None))?
+        } else {
+            delegated_claims(&token)
+                .filter(|claims| {
+                    let wanted = format!("tool:{}", request.name);
+                    claims["scope"]
+                        .as_str()
+                        .is_some_and(|scope| scope.split(' ').any(|s| s == wanted))
+                })
+                .ok_or_else(|| ErrorData::invalid_params("token is not for this tool", None))?
+        };
         let traceparent = context
             .extensions
             .get::<axum::http::request::Parts>()
@@ -188,6 +202,8 @@ pub struct Stack {
     /// An upstream `pause` call is waiting for [`Self::resume`].
     pub paused: Arc<std::sync::atomic::AtomicBool>,
     pub resume: Arc<tokio::sync::Notify>,
+    /// Times the fake upstream served `tools/list`.
+    pub list_count: Arc<std::sync::atomic::AtomicUsize>,
     stop: CancellationToken,
     _fixture: Fixture,
 }
@@ -230,6 +246,20 @@ impl Stack {
 
     /// Like [`Self::start`], appending `extra_toml` to the config.
     pub async fn start_with(agents_toml: Option<&str>, extra_toml: &str) -> Self {
+        Self::start_inner(agents_toml, extra_toml, None).await
+    }
+
+    /// Upstream `tools` with injected `token_file`, no audience. `listed`
+    /// puts that origin on `[egress] allow`.
+    pub async fn start_egress(agents_toml: Option<&str>, listed: bool) -> Self {
+        Self::start_inner(agents_toml, "", Some(listed)).await
+    }
+
+    async fn start_inner(
+        agents_toml: Option<&str>,
+        extra_toml: &str,
+        egress: Option<bool>,
+    ) -> Self {
         let stop = CancellationToken::new();
         let description = Arc::new(Mutex::new("Echo v1".to_string()));
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -237,6 +267,8 @@ impl Stack {
         let hold_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resume = Arc::new(tokio::sync::Notify::new());
+        let list_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let static_bearer = egress.map(|_| EGRESS_SECRET.to_string());
         let upstream = Upstream {
             paused: paused.clone(),
             resume: resume.clone(),
@@ -244,6 +276,8 @@ impl Stack {
             seen: seen.clone(),
             traceparents: traceparents.clone(),
             hold_entered: hold_entered.clone(),
+            static_bearer: static_bearer.clone(),
+            list_count: list_count.clone(),
         };
         let upstream_service = StreamableHttpService::new(
             move || Ok(upstream.clone()),
@@ -268,9 +302,24 @@ impl Stack {
         let path = fixture.jwks_config("127.0.0.1:0", &[("k1", &key(1))]);
         let text = std::fs::read_to_string(&path).unwrap()
             + &format!(
-                "\n[registry]\nfile = \"registry.json\"\naudit_file = \"audit.jsonl\"\nrefresh_interval_ms = 100\n\n[exchange]\ntoken_endpoint = \"http://{issuer_address}/token\"\nclient_id = \"sekisho\"\nclient_secret_file = \"client-secret\"\n\n[[upstreams]]\nname = \"tools\"\nurl = \"http://{upstream_address}/mcp\"\naudience = \"{ENGINE_AUDIENCE}\"\n"
+                "\n[registry]\nfile = \"registry.json\"\naudit_file = \"audit.jsonl\"\nrefresh_interval_ms = 100\n\n[exchange]\ntoken_endpoint = \"http://{issuer_address}/token\"\nclient_id = \"sekisho\"\nclient_secret_file = \"client-secret\"\n"
             );
-        std::fs::write(&path, text + extra_toml).unwrap();
+        let upstreams = if egress.is_some() {
+            fixture.write("egress-token", EGRESS_SECRET);
+            let origin = format!("http://{upstream_address}");
+            let allow = match egress {
+                Some(true) => format!("[egress]\nallow = [\"{origin}\"]\n"),
+                _ => "[egress]\nallow = [\"http://127.0.0.1:1\"]\n".into(),
+            };
+            format!(
+                "[[upstreams]]\nname = \"tools\"\nurl = \"http://{upstream_address}/mcp\"\ntoken_file = \"egress-token\"\n{allow}"
+            )
+        } else {
+            format!(
+                "[[upstreams]]\nname = \"tools\"\nurl = \"http://{upstream_address}/mcp\"\naudience = \"{ENGINE_AUDIENCE}\"\n"
+            )
+        };
+        std::fs::write(&path, text + &upstreams + extra_toml).unwrap();
         let config = Config::load(&path).unwrap();
         let store = sekisho::state::open(&config).unwrap();
         // The PostgreSQL backend is initialized and keeps the policy in the
@@ -290,6 +339,7 @@ impl Stack {
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
             Arc::clone(&store),
+            config.egress.clone(),
         ));
         tokio::spawn(
             federation
@@ -315,6 +365,7 @@ impl Stack {
         .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
             &store,
         )))
+        .egress(config.egress.clone())
         .limits(sekisho::limits::Limiter::from_config(&config, &store));
         let app = router(state, &config.mcp, gateway, stop.clone());
         let address = serve_on_loopback(app, stop.clone()).await;
@@ -329,6 +380,7 @@ impl Stack {
             hold_entered,
             paused,
             resume,
+            list_count,
             stop,
             _fixture: fixture,
         }
@@ -347,6 +399,7 @@ impl Stack {
         let federation = Arc::new(Federation::new(
             config.upstreams.clone(),
             Arc::clone(&store),
+            config.egress.clone(),
         ));
         federation.refresh().await.unwrap();
         tokio::spawn(federation.clone().run(
@@ -372,6 +425,7 @@ impl Stack {
         .mitigations(sekisho::mitigations::MitigationStore::new(Arc::clone(
             &store,
         )))
+        .egress(config.egress.clone())
         .limits(sekisho::limits::Limiter::from_config(config, &store));
         let app = router(state, &config.mcp, gateway, stop.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

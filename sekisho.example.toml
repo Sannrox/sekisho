@@ -31,6 +31,15 @@ url = "http://127.0.0.1:9100/mcp"
 # token_file = "ontology-token"        # optional bearer used to list tools
 audience = "ontology-engine"           # audience of exchanged tokens for these tools
 
+# External MCP servers omit `audience` and inject `token_file` on the call.
+# [[upstreams]]
+# name = "ext"
+# url = "http://127.0.0.1:9200/mcp"
+# token_file = "ext-token"
+
+# [egress]                             # origins allowed for credential-injected outbound
+# allow = ["http://127.0.0.1:9200"]    # scheme://host[:port]; empty refuses every egress call
+
 [policy]
 file = "agents.toml"                   # per-agent allowlists, read on every call
 

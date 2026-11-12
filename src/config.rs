@@ -95,6 +95,29 @@ pub struct Config {
     /// Upstream MCP servers whose tools the registry federates.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+    /// Origins the gateway may dial with a destination credential (#76).
+    #[serde(default)]
+    pub egress: EgressConfig,
+}
+
+/// Allowlist of origins for credential-injected outbound (#76).
+///
+/// Engine upstreams (`audience` set) do not consult this list. An empty
+/// `allow` refuses every egress call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EgressConfig {
+    /// Origins (`scheme://host[:port]`) the gateway may dial with `token_file`.
+    pub allow: Vec<String>,
+}
+
+impl EgressConfig {
+    /// Whether `url`'s origin is on the allowlist.
+    pub fn allows_url(&self, url: &str) -> bool {
+        crate::mitigations::destination(url, false)
+            .ok()
+            .is_some_and(|origin| self.allow.iter().any(|listed| listed == &origin))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,10 +233,20 @@ pub struct UpstreamConfig {
     /// The upstream's Streamable HTTP MCP endpoint.
     pub url: String,
     /// Optional bearer token file used to list the upstream's tools.
+    /// On an egress upstream (no `audience`) it is also injected on calls.
     #[serde(default)]
     pub token_file: Option<PathBuf>,
     /// Audience of exchanged tokens for this upstream's tools.
-    pub audience: String,
+    /// Omitted: this upstream is an egress destination; calls inject `token_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+}
+
+impl UpstreamConfig {
+    /// No audience: credential-injected egress, not token exchange.
+    pub fn egress(&self) -> bool {
+        self.audience.as_deref().is_none_or(str::is_empty)
+    }
 }
 
 /// The MCP endpoint at `/mcp` and its OAuth protected-resource metadata.
@@ -302,6 +335,10 @@ impl Config {
                 *token_file = base.join(&*token_file);
             }
         }
+        for origin in &mut config.egress.allow {
+            *origin =
+                crate::mitigations::destination(origin, true).map_err(ConfigError::Invalid)?;
+        }
         config.validate()?;
         Ok(config)
     }
@@ -335,6 +372,12 @@ impl Config {
             if !valid || upstream.name == "sekisho" || !names.insert(&upstream.name) {
                 return Err(ConfigError::Invalid(format!(
                     "upstream name {:?} must be unique and use letters, digits, - or _",
+                    upstream.name
+                )));
+            }
+            if upstream.egress() && upstream.token_file.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "upstream {:?} is egress and needs token_file",
                     upstream.name
                 )));
             }
@@ -445,5 +488,37 @@ mod tests {
             let error = format!("{:?}", Config::load(&path).unwrap_err());
             assert!(error.contains("is not supported"), "{refused:?}: {error}");
         }
+    }
+
+    #[test]
+    fn an_egress_upstream_needs_token_file_and_allow_entries_are_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sekisho.toml");
+        let write = |body: &str| std::fs::write(&path, format!("{}{body}", minimal("")));
+        write("[[upstreams]]\nname = \"ext\"\nurl = \"http://127.0.0.1:9/mcp\"\n").unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("token_file"), "{error}");
+
+        write(
+            "[[upstreams]]\nname = \"ext\"\nurl = \"http://127.0.0.1:9/mcp\"\ntoken_file = \"t\"\n\
+             [egress]\nallow = [\"http://127.0.0.1:9/secret\"]\n",
+        )
+        .unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("destination"), "{error}");
+
+        write(
+            "[[upstreams]]\nname = \"ext\"\nurl = \"http://127.0.0.1:9/mcp\"\ntoken_file = \"t\"\n\
+             [egress]\nallow = [\"HTTP://127.0.0.1:9\"]\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.upstreams[0].egress());
+        assert_eq!(loaded.egress.allow, ["http://127.0.0.1:9"]);
+        let token = dir.path().join("t");
+        assert_eq!(
+            loaded.upstreams[0].token_file.as_deref(),
+            Some(token.as_path())
+        );
     }
 }
