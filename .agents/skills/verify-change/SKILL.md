@@ -1,6 +1,6 @@
 ---
 name: verify-change
-description: Verify a Rust, documentation, configuration, or workflow change with proportionate deterministic checks. Use after implementation, before review, or when a contributor needs an exact evidence report without overstating unrun tests. Uses the shared Sannrox agent-kit installation.
+description: Verify a source, documentation, configuration, or workflow change with proportionate deterministic checks. Use after implementation, before review, or when a contributor needs an exact evidence report without overstating unrun tests. Uses the shared Sannrox agent-kit installation.
 ---
 
 # Verify Change
