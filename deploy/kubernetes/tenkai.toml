@@ -1,6 +1,6 @@
 # Tenkai product for sekisho on Kubernetes (template).
 #
-# This file and manifests/ are a template: `scripts/render-tenkai-product.sh`
+# This file and manifests/ are a template: `scripts/release/render-product.sh`
 # fills in the release version and the image digest. The release workflow
 # attaches the rendered product to each GitHub Release as
 # `sekisho-<version>-tenkai-kubernetes.tar.gz`. Install that, not this tree.

@@ -11,4 +11,5 @@ validate:
 	cargo fmt --check
 	cargo clippy --all-targets --locked -- -D warnings
 	cargo clippy --all-targets --locked --features postgres -- -D warnings
-	bash scripts/validate-release.sh
+	bash scripts/check-workflows.sh
+	python3 -m unittest discover -s scripts/tests -t .

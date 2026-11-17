@@ -14,12 +14,19 @@ before changing system boundaries.
 - `make validate`, `make test` and `make test-integration` are the local gates.
   They match CI (`.github/workflows/ci.yml`): `cargo build --all-targets --locked`,
   `cargo test --locked`, `cargo fmt --check`,
-  `cargo clippy --all-targets --locked -- -D warnings`, and
-  `bash scripts/validate-release.sh`.
-- `scripts/validate-release.sh` checks the release path (a `v*` tag push
-  dispatches `release.yml` from main for that tag): signed annotated tags,
-  CHANGELOG notes, SBOM, and the family release manifest. Pull requests and
-  dry runs must not publish or attest.
+  `cargo clippy --all-targets --locked -- -D warnings`,
+  `bash scripts/check-workflows.sh`, and
+  `python3 -m unittest discover -s scripts/tests -t .`.
+- `bash scripts/check-workflows.sh` lints `.github/workflows/` with a pinned
+  workflow linter and workflow security auditor (actionlint, zizmor), the
+  same locally and in CI.
+- `python3 -m unittest discover -s scripts/tests -t .` runs the release tests
+  in `scripts/tests/release/` (install
+  `scripts/tests/requirements.txt` with `--require-hashes` first). They cover
+  the scripts in `scripts/release/` (signed tags, CHANGELOG notes, SBOM, the
+  family release manifest, GitHub Release state) and assert the release
+  invariants on the parsed workflow YAML. Pull requests and dry runs must not
+  publish or attest.
 
 GitHub Issues are the planning source of truth. The workflow Skills are the
 shared agent-kit Skills (see [Shared agent skills](#shared-agent-skills)). Never commit hostnames, home paths, secrets or
@@ -145,7 +152,9 @@ planned work with neither is not a running lane.
 
 Parallel lanes must not collide. Collision surfaces in this repository are
 config and the MCP endpoint, verifier and token exchange, registry/policy/audit
-files, the cluster rate-limit store, and guardrails. Lanes that would both
+files, the cluster rate-limit store, guardrails, and the release path
+(`.github/workflows/`, `scripts/release/`, `scripts/tests/release/`,
+`scripts/check-workflows.sh`, `RELEASING.md`). Lanes that would both
 change one of these surfaces run in sequence, not in parallel.
 
 A lane publishes its first Verified commit to the claim branch with
@@ -193,6 +202,13 @@ Add focused tests for changes touching the MCP endpoint, registry, policy,
 token exchange, limits, guardrails, or audit. Prefer deterministic tests that
 do not require an issuer or upstream. Offline `cargo test` must stay green
 without those services.
+
+Release logic lives in scripts under `scripts/release/`, not inline in
+workflow `run:` blocks; each script has a matching `unittest` file in
+`scripts/tests/release/` (the root `tests/` belongs to Cargo). Never grep
+workflow text: an invariant no linter expresses gets a test in
+`scripts/tests/release/test_workflows.py` that asserts on the parsed YAML's
+structure, not on step names or wording.
 
 ## Commit & Pull Request Guidelines
 
@@ -300,6 +316,7 @@ Rows beyond `## Testing Guidelines`:
 | Rust source | focused tests, then `make update`, `make validate`, `make test`, `make test-integration` |
 | MCP / gateway | the affected integration test under `tests/` plus the normal suite |
 | configuration | parsing/default tests, `sekisho.example.toml`, README |
+| release path and workflows | `bash scripts/check-workflows.sh`, `python3 -m unittest discover -s scripts/tests -t .` |
 | PostgreSQL state backend | `cargo test --locked --features postgres --test state_backends` with `SEKISHO_TEST_POSTGRES_URL` set to a disposable database; skipped otherwise with the reason stated |
 
 ### Release audit

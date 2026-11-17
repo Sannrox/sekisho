@@ -1,7 +1,7 @@
 # Tenkai product on Kubernetes
 
 This directory is the template for sekisho's Tenkai product. Each release
-renders it with `scripts/render-tenkai-product.sh` and attaches the result
+renders it with `scripts/release/render-product.sh` and attaches the result
 to the GitHub Release as `sekisho-<version>-tenkai-kubernetes.tar.gz`. Install
 the rendered product. The template itself has placeholders and is not
 installable.

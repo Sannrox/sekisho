@@ -3,3 +3,4 @@
 
 # Delivery lane worktrees (AGENTS.md, "Parallel delivery lanes")
 /.worktrees/
+__pycache__/

@@ -70,16 +70,17 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
 `release.yml` refuses a tagged run that does not start from `main`. It then:
 
 - checks out the tag and fetches the annotated tag object
-- verifies the signed tag with main's `scripts/verify-release-tag.sh` and
+- verifies the signed tag with main's `scripts/release/verify-tag.sh` and
   main's allowed keys against the tagged commit's `Cargo.toml`
 - requires the tagged commit to be on `main`
-- runs the release scripts, tests, packaging and the image build from that
-  commit, writes it as the manifest `git_sha`, and creates the release with
-  `gh release create <tag> --verify-tag`
-- writes an SBOM, attests provenance, drafts the GitHub Release from the
-  matching CHANGELOG section with the family release manifest (component,
-  version, git SHA, binary and image digests, attestation URLs, gate flags),
-  and publishes only after every asset is attached
+- runs the release tests, packaging and the image build from that commit
+  and writes it as the manifest `git_sha`; a tagged package fails when the
+  merged pull requests for the manifest gate flags cannot be read
+- writes an SBOM, attests provenance, drafts the GitHub Release for the
+  existing tag through `scripts/release/github-release.sh` from the matching
+  CHANGELOG section with the family release manifest (component, version,
+  git SHA, binary and image digests, attestation URLs, gate flags), and
+  publishes only after every asset is attached
 
 The release image is tagged with the version only. There is no `latest` tag.
 Deploy the image by digest.
@@ -105,12 +106,17 @@ Pull requests and `workflow_dispatch` without a tag dry-run the same
 packaging path on that ref. Dry runs never build images, mint attestations,
 or touch a GitHub Release.
 
+The logic lives in `scripts/release/`; the workflows only call it.
+`scripts/tests/release/` tests each script and asserts the invariants above
+on the parsed workflow YAML, and `scripts/check-workflows.sh` lints the
+workflows. CI runs both on every pull request.
+
 ## Tenkai product
 
 A tagged run pushes the image as `ghcr.io/sannrox/sekisho:<version>` (never
 `latest`) and attaches `sekisho-<version>-tenkai-kubernetes.tar.gz`: the
 [Kubernetes product](deploy/kubernetes/README.md) rendered with
-`scripts/render-tenkai-product.sh`, with the image and the profile's
+`scripts/release/render-product.sh`, with the image and the profile's
 component pin set to the pushed digest. The family manifest lists the pushed
 image and the archive with their digests, and the archive is attested with
 the other assets. A re-run of a draft rebuilds and re-pushes the version tag;
