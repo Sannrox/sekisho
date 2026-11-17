@@ -7,8 +7,10 @@
 # Usage: bash scripts/validate-workflow-skills.sh [--render]
 #
 # Clones Sannrox/agent-kit into ${AGENT_KIT_HOME:-$HOME/.agents/agent-kit} when
-# missing, otherwise fast-forwards it to the latest main (set AGENT_KIT_DIR to
-# use a checkout as-is), then runs the kit's scripts/check-consumer.sh.
+# missing, otherwise fetches the latest main: a checkout on main fast-forwards,
+# and one on any other branch (or detached) stays untouched while the check
+# runs against a snapshot of the fetched main. Set AGENT_KIT_DIR to use a
+# checkout as-is. Then runs the kit's scripts/check-consumer.sh.
 # --render rewrites stubs and vendored scripts from the kit.
 set -euo pipefail
 
@@ -19,7 +21,15 @@ if [ -n "${AGENT_KIT_DIR:-}" ]; then
 else
   kit="${AGENT_KIT_HOME:-$HOME/.agents/agent-kit}"
   if [ -d "${kit}/.git" ]; then
-    git -C "$kit" pull --quiet --ff-only origin main
+    git -C "$kit" fetch --quiet origin main
+    if [ "$(git -C "$kit" symbolic-ref --quiet --short HEAD || true)" = main ]; then
+      git -C "$kit" merge --quiet --ff-only FETCH_HEAD
+    else
+      snapshot="$(mktemp -d "${TMPDIR:-/tmp}/agent-kit-main.$$.XXXXXX")"
+      trap 'rm -rf "$snapshot"' EXIT
+      git -C "$kit" archive FETCH_HEAD | tar -x -C "$snapshot"
+      kit="$snapshot"
+    fi
   else
     mkdir -p "$(dirname "$kit")"
     git clone --quiet https://github.com/Sannrox/agent-kit "$kit"
