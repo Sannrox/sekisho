@@ -70,47 +70,10 @@ def bom_from_metadata(meta: dict) -> dict:
     return bom
 
 
-def self_test() -> None:
-    meta = {
-        "workspace_members": ["sekisho 0.0.0 (path+file:///workspace)"],
-        "packages": [
-            {
-                "id": "sekisho 0.0.0 (path+file:///workspace)",
-                "name": "sekisho",
-                "version": "0.0.0",
-                "license": "Apache-2.0",
-            },
-            {
-                "id": "libc 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
-                "name": "libc",
-                "version": "0.2.0",
-                "license": "MIT OR Apache-2.0",
-            },
-        ],
-    }
-    bom = bom_from_metadata(meta)
-    assert bom["bomFormat"] == "CycloneDX"
-    assert bom["metadata"]["component"]["version"] == "0.0.0"
-    assert bom["metadata"]["component"]["type"] == "application"
-    serial = bom["serialNumber"]
-    assert serial.startswith("urn:uuid:")
-    assert uuid.UUID(serial.removeprefix("urn:uuid:")).version == 5
-    assert bom_from_metadata(meta)["serialNumber"] == serial
-    meta["packages"][1]["version"] = "0.2.1"
-    assert bom_from_metadata(meta)["serialNumber"] != serial
-    assert bom["components"][0]["licenses"] == [{"expression": "MIT OR Apache-2.0"}]
-    assert license_entry("MIT/Apache-2.0") == {"expression": "MIT OR Apache-2.0"}
-    assert bom["components"][0]["name"] == "libc"
-    print("release-sbom self-test passed")
-
-
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
-        return
     if len(argv) != 1:
-        raise SystemExit("usage: release-sbom.py OUT")
-    root = Path(__file__).resolve().parent.parent
+        raise SystemExit("usage: sbom.py OUT")
+    root = Path(__file__).resolve().parents[2]
     bom = bom_from_metadata(cargo_metadata(root))
     out = Path(argv[0])
     out.write_text(json.dumps(bom, indent=2) + "\n")

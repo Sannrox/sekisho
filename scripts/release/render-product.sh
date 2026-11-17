@@ -4,14 +4,14 @@
 # component, to the image's registry digest. A tag is refused.
 #
 # Usage:
-#   bash scripts/render-tenkai-product.sh --image <repo>@sha256:<hex> --out DIR
+#   bash scripts/release/render-product.sh --image <repo>@sha256:<hex> --out DIR
 #        [--version X.Y.Z]   # default: the crate version in Cargo.toml
 set -euo pipefail
 
-ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 fail() {
-  printf 'render-tenkai-product: %s\n' "$1" >&2
+  printf 'render-product: %s\n' "$1" >&2
   exit 1
 }
 
@@ -50,7 +50,7 @@ for path in sorted(p for p in out.rglob("*") if p.is_file()):
         text = text.replace(key, value)
     left = re.findall(r"@[A-Z_]+@", text)
     if left:
-        sys.exit(f"render-tenkai-product: {path.name} keeps unknown placeholders {sorted(set(left))}")
+        sys.exit(f"render-product: {path.name} keeps unknown placeholders {sorted(set(left))}")
     path.write_text(text)
 PY
 

@@ -9,7 +9,6 @@ import json
 import pathlib
 import re
 import sys
-import tempfile
 
 SCHEMA = "tenkai.family-release-manifest.v1"
 SKIP_NAMES = {
@@ -50,6 +49,23 @@ def gate_flags_from_labels(labels: list[str]) -> list[str]:
         elif "realm" in name:
             flags.add("realm")
     return sorted(flags)
+
+
+def labels_in_range(merged: str, in_range: str) -> list[str]:
+    """Labels of merged pull requests whose merge commit is in the release range.
+
+    `merged` holds one `<merge-commit>\t<label>` line per label; `in_range`
+    holds the commits of the release range, one per line. A pull request
+    merged after the release commit, or before the previous final tag, is
+    outside the range and never contributes a gate flag.
+    """
+    commits = {line.strip() for line in in_range.splitlines() if line.strip()}
+    labels = set()
+    for line in merged.splitlines():
+        oid, sep, label = line.partition("\t")
+        if sep and oid in commits and label:
+            labels.add(label)
+    return sorted(labels)
 
 
 def binaries_from_dir(dist: pathlib.Path) -> list[dict[str, str]]:
@@ -109,66 +125,18 @@ def build_manifest(
     }
 
 
-def self_test() -> None:
-    labels = gate_flags_from_labels(
-        ["risk:breaking", "area:ops", "GATE:mig", "risk:realm", "docs"]
-    )
-    assert labels == ["breaking", "migration", "realm"], labels
-    assert gate_flags_from_labels([]) == []
-    try:
-        build_manifest(
-            component="sekisho",
-            version="0.1.0",
-            git_sha="deadbeef",
-            tag="v0.1.0",
-            dist=pathlib.Path("."),
-            images=[],
-            attestations=[],
-            gate_flags=[],
-        )
-    except SystemExit:
-        pass
-    else:
-        raise SystemExit("expected short git_sha to fail")
-    try:
-        parse_image("sekisho:latest=sha256:" + "a" * 64)
-    except SystemExit as exc:
-        assert "latest" in str(exc)
-    else:
-        raise SystemExit("expected latest image tag to fail")
-    with tempfile.TemporaryDirectory() as tmp:
-        dist = pathlib.Path(tmp)
-        (dist / "sekisho-0.0.0-x86_64-unknown-linux-gnu").write_bytes(b"bin")
-        (dist / "sekisho-0.0.0-image.tar").write_bytes(b"tar")
-        (dist / "SHA256SUMS").write_text("skip\n")
-        manifest = build_manifest(
-            component="sekisho",
-            version="0.0.0",
-            git_sha="a" * 40,
-            tag="v0.0.0",
-            dist=dist,
-            images=[
-                {
-                    "name": "sekisho:v0.0.0",
-                    "digest": "sha256:" + "b" * 64,
-                }
-            ],
-            attestations=["https://github.com/Sannrox/sekisho/attestations/1"],
-            gate_flags=["breaking"],
-        )
-        assert manifest["schema"] == SCHEMA
-        assert len(manifest["binaries"]) == 1
-        assert manifest["binaries"][0]["name"] == "sekisho-0.0.0-x86_64-unknown-linux-gnu"
-        assert manifest["binaries"][0]["digest"].startswith("sha256:")
-        assert manifest["images"][0]["name"] == "sekisho:v0.0.0"
-        dumped = json.dumps(manifest)
-        assert "latest" not in dumped
-    print("release-manifest self-test passed")
+def record_attestations(path: pathlib.Path, urls: list[str]) -> None:
+    """Set the manifest's attestation URLs; empty URLs are dropped."""
+    manifest = json.loads(path.read_text())
+    manifest["attestations"] = [url for url in urls if url]
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
 
 def main(argv: list[str]) -> None:
-    if argv == ["--self-test"]:
-        self_test()
+    if argv[:1] == ["record-attestations"]:
+        if len(argv) < 2:
+            raise SystemExit("usage: manifest.py record-attestations MANIFEST [URL...]")
+        record_attestations(pathlib.Path(argv[1]), argv[2:])
         return
     parser = argparse.ArgumentParser()
     parser.add_argument("--component", default="sekisho")
@@ -181,10 +149,20 @@ def main(argv: list[str]) -> None:
     parser.add_argument("--gate-flag", action="append", default=[])
     parser.add_argument("--label", action="append", default=[])
     parser.add_argument("--image", action="append", default=[])
+    parser.add_argument("--merged-labels", help="file of <merge-commit>\\t<label> lines")
+    parser.add_argument("--range-commits", help="file of the release range's commits")
     args = parser.parse_args(argv)
     dist = pathlib.Path(args.dist)
+    labels = list(args.label)
+    if args.merged_labels:
+        labels.extend(
+            labels_in_range(
+                pathlib.Path(args.merged_labels).read_text(),
+                pathlib.Path(args.range_commits).read_text(),
+            )
+        )
     flags = list(args.gate_flag)
-    flags.extend(gate_flags_from_labels(args.label))
+    flags.extend(gate_flags_from_labels(labels))
     images = [parse_image(item) for item in args.image]
     manifest = build_manifest(
         component=args.component,

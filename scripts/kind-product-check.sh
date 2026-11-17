@@ -91,8 +91,8 @@ CURRENT_IMAGE="$(push "${WORK}/current-image.tar" current)"
 # Product versions are local labels; the images are what is being tested.
 PREVIOUS_VERSION="0.0.0-kind.1"
 CURRENT_VERSION="0.0.0-kind.2"
-bash "${ROOT_PATH}/scripts/render-tenkai-product.sh" --image "$PREVIOUS_IMAGE" --version "$PREVIOUS_VERSION" --out "${WORK}/previous"
-bash "${ROOT_PATH}/scripts/render-tenkai-product.sh" --image "$CURRENT_IMAGE" --version "$CURRENT_VERSION" --out "${WORK}/current"
+bash "${ROOT_PATH}/scripts/release/render-product.sh" --image "$PREVIOUS_IMAGE" --version "$PREVIOUS_VERSION" --out "${WORK}/previous"
+bash "${ROOT_PATH}/scripts/release/render-product.sh" --image "$CURRENT_IMAGE" --version "$CURRENT_VERSION" --out "${WORK}/current"
 
 say "consumer product"
 CONSUMER_PIN="sha256:$(printf 'sekisho-kind-consumer' | shasum -a 256 | cut -d' ' -f1)"
